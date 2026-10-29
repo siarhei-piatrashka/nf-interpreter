@@ -428,6 +428,8 @@ enum CLR_DataType // KEEP IN SYNC WITH nanoCLR_DataType enum in nanoFramework.To
 #endif
     DATATYPE_APPDOMAIN_LAST = DATATYPE_VTU_PORT_LAST + 3,
 
+    DATATYPE_FNPTR, // Signature only: managed calling convention, argument count, return type, argument types.
+
     DATATYPE_FIRST_INVALID,
 
     // Type modifies. This is exact copy of VALUES ELEMENT_TYPE_* from CorHdr.h

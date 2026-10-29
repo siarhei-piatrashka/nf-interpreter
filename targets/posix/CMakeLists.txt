@@ -37,6 +37,11 @@ if(APPLE)
 endif()
 
 option(NANO_POSIX_ENABLE_SMOKE "Build smoke behavior (banner/version output)." ON)
+option(NANO_POSIX_BUILD_CLR_TESTS "Build native CLR regression tests." OFF)
+
+if(NANO_POSIX_BUILD_CLR_TESTS)
+    enable_testing()
+endif()
 
 # Note: the standard embedded-target layout (nanoBooter/ + nanoCLR/ + common/) applies to
 # board targets (ChibiOS, ThreadX, ESP32, etc.).  Host/virtual targets (targets/win32,

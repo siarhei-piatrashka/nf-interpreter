@@ -339,3 +339,16 @@ set_target_properties(
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 endif()
+
+if(NANO_POSIX_BUILD_CLR_TESTS)
+    add_executable(nanoCLR_function_pointer_tests
+        tests/function_pointers.cpp
+        $<TARGET_OBJECTS:nanoFramework.nanoCLR>
+    )
+    target_compile_features(nanoCLR_function_pointer_tests PRIVATE cxx_std_20)
+    target_include_directories(nanoCLR_function_pointer_tests PRIVATE
+        $<TARGET_PROPERTY:nanoFramework.nanoCLR,INCLUDE_DIRECTORIES>
+    )
+    target_compile_definitions(nanoCLR_function_pointer_tests PRIVATE ${NANOCLR_POSIX_COMMON_DEFINITIONS})
+    add_test(NAME managed_function_pointers COMMAND nanoCLR_function_pointer_tests)
+endif()

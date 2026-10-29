@@ -1789,6 +1789,11 @@ HRESULT CLR_RT_ExecutionEngine::InitializeReference(CLR_RT_HeapBlock &ref, CLR_R
 
     dt = res.m_dt;
 
+    if (dt == DATATYPE_FNPTR)
+    {
+        dt = DATATYPE_U4;
+    }
+
     if (res.m_levels > 0) // Array
     {
         dt = DATATYPE_OBJECT;
@@ -1884,6 +1889,18 @@ HRESULT CLR_RT_ExecutionEngine::InitializeLocals(
                     levels++;
                     break;
 
+                case DATATYPE_FNPTR:
+                {
+                    CLR_RT_SignatureParser sub{};
+                    CLR_RT_SignatureParser::Element res;
+                    sub.Initialize_TypeSpec(assm, sig - 1);
+                    NANOCLR_CHECK_HRESULT(sub.Advance(res));
+                    sig = sub.m_sig;
+                    dt = DATATYPE_U4;
+                    cls = res.m_cls;
+                }
+                    goto done;
+
                 case DATATYPE_CLASS:
                 case DATATYPE_VALUETYPE:
                 {
@@ -1921,6 +1938,11 @@ HRESULT CLR_RT_ExecutionEngine::InitializeLocals(
 
                 default:
                 {
+                    if (dt >= DATATYPE_FIRST_INVALID)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                    }
+
                     const CLR_RT_TypeDef_Index *cls2 = c_CLR_RT_DataTypeLookup[dt].m_cls;
 
                     if (cls2 == NULL)

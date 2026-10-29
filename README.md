@@ -20,6 +20,46 @@ Document Language: [English](README.md) | [中文简体](README.zh-cn.md)
 There is currently ongoing a Public Preview of the CLR with support for C# generics.
 If you want to use this feature please refer to the [documentation](README-GENERICS.md).
 
+## Managed function pointers (runtime support)
+
+The CLR supports managed C# function pointers (`delegate*<...>` and `delegate* managed<...>`) to static methods.
+Enable unsafe compilation and use C# 9 or later:
+
+```csharp
+public unsafe static void Main()
+{
+    delegate*<string, void> func = &NativeMethod;
+    func("hello!");
+}
+
+public static void NativeMethod(string s)
+{
+}
+```
+
+Only the managed default calling convention is supported. Unmanaged calling conventions, native addresses,
+varargs, and instance-method indirect calls are rejected. Function pointers are allocation-free 32-bit managed
+method indices, not machine-code addresses; existing delegate construction still allocates a delegate object.
+Null pointer calls raise a null-reference error, and indirect-call signatures must match the target method.
+Function-pointer reflection types are not exposed; pointer storage uses the CLR's unsigned 32-bit representation.
+
+**Toolchain dependency:** firmware support alone does not make the example deployable. The separate
+[metadata processor](https://github.com/nanoframework/metadata-processor) must implement function-pointer
+signatures and `calli` operands. Its current `InlineSig` writer omits the operand. Matching tooling must:
+
+- Append `DATATYPE_FNPTR` (`57`, `0x39`) to the compact datatype enum without renumbering existing entries.
+- Encode a function-pointer type as `DATATYPE_FNPTR`, default calling convention (`0`), one-byte parameter
+  count, compact return type, and compact parameter types. Nested function-pointer types use the same encoding.
+- Intern each `calli` call-site signature in `TBL_Signatures` and write its four-byte little-endian token
+  `(TBL_Signatures << 24) | signatureOffset` after opcode `0x29`. Signature offsets are zero-based, like other
+  signature references; do not emit a desktop `StandAloneSig` token.
+- Include the function pointer in `calli`'s stack pop count, retain referenced target methods during dependency
+  analysis, and account for the full operand when calculating branch offsets and exception-handler ranges.
+- Reject unmanaged function pointers rather than translating them into managed pointers.
+
+The [POSIX host tests](targets/posix/README.md#native-clr-regression-tests) exercise compact metadata directly
+and do not replace end-to-end testing with an updated metadata processor.
+
 ## .NET nanoFramework interpreter for reference boards
 
 Each of the linked files contain the firmware binaries for nanoBooter (if applicable) and nanoCLR in various formats (`.HEX`, `.BIN` and `.DFU`). They should be flashed to the target board using [nanoff](https://github.com/nanoframework/nanoFirmwareFlasher) or the appropriate software utility depending on the target MCU.

@@ -142,6 +142,8 @@ const CLR_RT_DataTypeLookup c_CLR_RT_DataTypeLookup[] =
     DATATYPE_NOT_SUPPORTED
     DATATYPE_NOT_SUPPORTED
 #endif
+
+    { DT_NUM | DT_INT | DT_PRIM | DT_DIR | DT_OPT | DT_MT, 32, DT_U4, DT_T(U4), DT_CNV(FNPTR), DT_CLS(m_UInt32), DT_NOREL(CLR_RT_HeapBlock) DT_OPT_NAME(FNPTR) }, // DATATYPE_FNPTR (signature only)
     
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 };

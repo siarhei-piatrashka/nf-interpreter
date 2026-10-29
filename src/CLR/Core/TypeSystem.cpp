@@ -325,6 +325,8 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
 
     res.m_fByRef = false;
     res.m_levels = 0;
+    res.m_fnPtrAssembly = NULL;
+    res.m_fnPtrSignature = NULL;
 
     switch (m_type)
     {
@@ -415,6 +417,30 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
                         res.m_levels++;
                         break;
 
+                    case DATATYPE_FNPTR:
+                    {
+                        CLR_RT_SignatureParser sub{};
+                        sub.Initialize_MethodSignature(m_assm, m_sig);
+
+                        if (sub.m_flags != PIMAGE_CEE_CS_CALLCONV_DEFAULT)
+                        {
+                            NANOCLR_SET_AND_LEAVE(CLR_E_NOT_SUPPORTED);
+                        }
+
+                        res.m_fnPtrAssembly = m_assm;
+                        res.m_fnPtrSignature = m_sig;
+                        res.m_cls = g_CLR_RT_WellKnownTypes.m_UInt32;
+
+                        while (sub.Available())
+                        {
+                            Element element;
+                            NANOCLR_CHECK_HRESULT(sub.Advance(element));
+                        }
+
+                        m_sig = sub.m_sig;
+                        NANOCLR_SET_AND_LEAVE(S_OK);
+                    }
+
                     case DATATYPE_CLASS:
                     case DATATYPE_VALUETYPE:
                     {
@@ -457,6 +483,11 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
 
                     default:
                     {
+                        if (res.m_dt >= DATATYPE_FIRST_INVALID)
+                        {
+                            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                        }
+
                         const CLR_RT_TypeDef_Index *cls = c_CLR_RT_DataTypeLookup[res.m_dt].m_cls;
 
                         if (cls)
@@ -850,6 +881,29 @@ bool CLR_RT_MethodDef_Instance::InitializeFromIndex(const CLR_RT_MethodDef_Index
     m_target = NULL;
 
     return false;
+}
+
+bool CLR_RT_MethodDef_Instance::InitializeFromFunctionPointer(CLR_UINT32 value)
+{
+    NATIVE_PROFILE_CLR_CORE();
+    Clear();
+
+    CLR_RT_MethodDef_Index method;
+    method.m_data = value;
+
+    CLR_UINT32 assemblyIndex = method.Assembly();
+    if (assemblyIndex == 0 || assemblyIndex > g_CLR_RT_TypeSystem.m_assembliesMax)
+    {
+        return false;
+    }
+
+    CLR_RT_Assembly *assm = g_CLR_RT_TypeSystem.m_assemblies[assemblyIndex - 1];
+    if (assm == NULL || method.Method() >= assm->m_pTablesSize[TBL_MethodDef])
+    {
+        return false;
+    }
+
+    return InitializeFromIndex(method);
 }
 
 void CLR_RT_MethodDef_Instance::Clear()
@@ -4204,6 +4258,21 @@ bool CLR_RT_TypeSystem::MatchSignatureElement(
     bool fIsInstanceOfOK)
 {
     NATIVE_PROFILE_CLR_CORE();
+    if (resLeft.m_dt == DATATYPE_FNPTR || resRight.m_dt == DATATYPE_FNPTR)
+    {
+        if (resLeft.m_dt != resRight.m_dt || resLeft.m_fByRef != resRight.m_fByRef ||
+            resLeft.m_levels != resRight.m_levels)
+        {
+            return false;
+        }
+
+        CLR_RT_SignatureParser left{};
+        CLR_RT_SignatureParser right{};
+        left.Initialize_MethodSignature(resLeft.m_fnPtrAssembly, resLeft.m_fnPtrSignature);
+        right.Initialize_MethodSignature(resRight.m_fnPtrAssembly, resRight.m_fnPtrSignature);
+        return MatchSignature(left, right);
+    }
+
     if (fIsInstanceOfOK)
     {
         CLR_RT_ReflectionDef_Index idxLeft;

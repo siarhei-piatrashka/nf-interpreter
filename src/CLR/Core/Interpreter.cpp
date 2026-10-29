@@ -2108,6 +2108,64 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
 
                 //----------------------------------------------------------------------------------------------------------//
                 //----------------------------------------------------------------------------------------------------------//
+                OPDEF(CEE_CALLI, "calli", VarPop, VarPush, InlineSig, IPrimitive, 1, 0xFF, 0x29, CALL)
+                {
+                    FETCH_ARG_TOKEN(arg, ip);
+
+                    CLR_UINT32 offset = CLR_DataFromTk(arg);
+                    CLR_UINT32 signatureSize = assm->m_header->SizeOfTable(TBL_Signatures);
+                    if (CLR_TypeFromTk(arg) != TBL_Signatures || offset >= signatureSize || signatureSize - offset < 3)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                    }
+
+                    CLR_RT_SignatureParser signature{};
+                    signature.Initialize_MethodSignature(assm, assm->GetSignature(offset));
+                    if (signature.m_flags != PIMAGE_CEE_CS_CALLCONV_DEFAULT)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_NOT_SUPPORTED);
+                    }
+
+                    CLR_UINT32 numArgs = signature.Available() - 1;
+                    if (&evalPos[1] - stack->m_evalStack < numArgs + 1)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_STACK_UNDERFLOW);
+                    }
+
+                    if (evalPos[0].DataType() != DATATYPE_U4 && evalPos[0].DataType() != DATATYPE_I4)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                    }
+
+                    CLR_UINT32 method = evalPos[0].NumericByRef().u4;
+                    if (method == 0)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_NULL_REFERENCE);
+                    }
+
+                    CLR_RT_MethodDef_Instance callee{};
+                    if (!callee.InitializeFromFunctionPointer(method) ||
+                        (callee.m_target->flags & CLR_RECORD_METHODDEF::MD_Static) == 0 ||
+                        callee.m_target->numArgs != numArgs)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                    }
+
+                    CLR_RT_SignatureParser target{};
+                    target.Initialize_MethodSignature(callee.m_assm, callee.m_target);
+                    if (!CLR_RT_TypeSystem::MatchSignature(signature, target))
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                    }
+
+                    evalPos--;
+                    WRITEBACK(stack, evalPos, ip, fDirty);
+                    NANOCLR_CHECK_HRESULT(CLR_RT_StackFrame::Push(th, callee, -1));
+                    goto Execute_Restart;
+                }
+
+                //----------------------------------------------------------------------------------------------------------//
+
                 OPDEF(CEE_CALL, "call", VarPop, VarPush, InlineMethod, IPrimitive, 1, 0xFF, 0x28, CALL)
                 OPDEF(CEE_CALLVIRT, "callvirt", VarPop, VarPush, InlineMethod, IObjModel, 1, 0xFF, 0x6F, CALL)
 
@@ -2363,8 +2421,7 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     if (cls.m_target->IsDelegate())
                     {
                         //
-                        // Special case for delegates. LDFTN or LDVIRTFTN have already created the delegate object, just
-                        // check that...
+                        // LDFTN and LDVIRTFTN produce method indices; allocate the delegate only when constructed.
                         //
                         changes = -calleeInst.m_target->numArgs;
                         NANOCLR_CHECK_HRESULT(CLR_Checks::VerifyStackOK(
@@ -2375,26 +2432,24 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
 
                         top = stack->m_evalStackPos++; // Push back the result.
 
-                        if (top[1].DataType() != DATATYPE_OBJECT)
+                        if (top[1].DataType() != DATATYPE_U4)
                         {
                             NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                         }
 
-                        CLR_RT_HeapBlock_Delegate *dlg = top[1].DereferenceDelegate();
-
-                        if (dlg == NULL)
-                        {
-                            NANOCLR_CHECK_HRESULT(CLR_E_NULL_REFERENCE);
-                        }
-
-                        dlg->m_cls = cls;
-
+                        CLR_RT_MethodDef_Index method;
+                        method.m_data = top[1].NumericByRef().u4;
                         CLR_RT_MethodDef_Instance dlgInst{};
-
-                        if (dlgInst.InitializeFromIndex(dlg->DelegateFtn()) == false)
+                        if (dlgInst.InitializeFromFunctionPointer(method.m_data) == false)
                         {
                             NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                         }
+
+                        // Keep the target rooted while allocation can trigger a collection.
+                        stack->m_evalStackPos = top + 2;
+                        NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(top[1], method, stack));
+                        CLR_RT_HeapBlock_Delegate *dlg = top[1].DereferenceDelegate();
+                        dlg->m_cls = cls;
 
                         if ((dlgInst.m_target->flags & CLR_RECORD_METHODDEF::MD_Static) == 0)
                         {
@@ -2402,6 +2457,7 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                         }
 
                         top->SetObjectReference(dlg);
+                        stack->m_evalStackPos = top + 1;
                     }
                     else
                     {
@@ -3299,9 +3355,7 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     if (method.ResolveToken(arg, assm) == false)
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
 
-                    UPDATESTACK(stack, evalPos);
-
-                    NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(evalPos[0], method, stack));
+                    evalPos[0].SetInteger((CLR_UINT32)method.m_data);
                     break;
                 }
 
@@ -3325,9 +3379,7 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     }
 
-                    UPDATESTACK(stack, evalPos);
-
-                    NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(evalPos[0], calleeReal, stack));
+                    evalPos[0].SetInteger((CLR_UINT32)calleeReal.m_data);
                     break;
                 }
 
@@ -3442,7 +3494,6 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                 OPDEF(CEE_CPBLK, "cpblk", PopI + PopI + PopI, Push0, InlineNone, IPrimitive, 2, 0xFE, 0x17, NEXT)
                 OPDEF(CEE_JMP, "jmp", Pop0, Push0, InlineMethod, IPrimitive, 1, 0xFF, 0x27, CALL)
                 OPDEF(CEE_INITBLK, "initblk", PopI + PopI + PopI, Push0, InlineNone, IPrimitive, 2, 0xFE, 0x18, NEXT)
-                OPDEF(CEE_CALLI, "calli", VarPop, VarPush, InlineSig, IPrimitive, 1, 0xFF, 0x29, CALL)
                 OPDEF(CEE_CKFINITE, "ckfinite", Pop1, PushR8, InlineNone, IPrimitive, 1, 0xFF, 0xC3, NEXT)
                 OPDEF(CEE_LOCALLOC, "localloc", PopI, PushI, InlineNone, IPrimitive, 2, 0xFE, 0x0F, NEXT)
                 OPDEF(CEE_MKREFANY, "mkrefany", PopI, Push1, InlineType, IPrimitive, 1, 0xFF, 0xC6, NEXT)

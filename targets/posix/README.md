@@ -65,6 +65,22 @@ Pass PE files directly to the test harness in the same order used by the nanoclr
 
 The macro `PLATFORM_POSIX_HOST` is defined by the build system and gates POSIX-specific branches in the shared headers.
 
+## Native CLR Regression Tests
+
+The managed function-pointer tests run the actual interpreter against compact metadata fixtures, independently
+of the external metadata processor. Enable them explicitly:
+
+```bash
+cmake -S targets/posix -B build/posix -G Ninja -DNANO_POSIX_BUILD_CLR_TESTS=ON
+cmake --build build/posix
+ctest --test-dir build/posix --output-on-failure
+```
+
+Coverage includes managed signature parsing and matching, pointer local/field initialization, indirect calls
+with arguments and return values, by-reference parameters, string-to-void calls, pointer identity, null/invalid
+pointer rejection, unmanaged convention rejection, and static/virtual delegate construction and invocation.
+These tests do not require a board or managed PE files.
+
 ## Native Assembly Table
 
 The interop table in `posix_stubs.cpp` registers the same portable set as the win32 virtual-device target. Hardware/network assemblies (GPIO, I2C, SPI, IO.Ports) are included with `NotImplementedStub()` bodies — they satisfy the PE checksum check at load time so tests that reference these assemblies don't abort, but calling their native methods throws `NotImplementedException`.

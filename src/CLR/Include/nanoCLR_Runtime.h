@@ -1036,6 +1036,8 @@ struct CLR_RT_SignatureParser
         int m_levels;
         CLR_DataType m_dt;
         CLR_RT_TypeDef_Index m_cls;
+        CLR_RT_Assembly *m_fnPtrAssembly;
+        CLR_PMETADATA m_fnPtrSignature;
     };
 
     CLR_RT_HeapBlock *m_lst;
@@ -1955,6 +1957,7 @@ struct CLR_RT_MethodDef_Instance : public CLR_RT_MethodDef_Index
     //--//
 
     bool InitializeFromIndex(const CLR_RT_MethodDef_Index &idx);
+    bool InitializeFromFunctionPointer(CLR_UINT32 value);
     void Clear();
 
     bool ResolveToken(CLR_UINT32 tk, CLR_RT_Assembly *assm);
