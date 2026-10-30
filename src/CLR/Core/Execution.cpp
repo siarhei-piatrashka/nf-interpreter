@@ -2252,6 +2252,11 @@ HRESULT CLR_RT_ExecutionEngine::InitializeLocals(
                     dtModifier = DATATYPE_TYPE_PINNED;
                     break;
 
+                // managed function pointer signature index (method signatures only), the storage type follows
+                case DATATYPE_TYPE_FNPTR:
+                    sig += 2;
+                    break;
+
                 // Array declared on stack        .locals init [0] int16[] foo,
                 case DATATYPE_SZARRAY:
                 // Reference declared on stack - .locals init [1] int16& pinned pShort,

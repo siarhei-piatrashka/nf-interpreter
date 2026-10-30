@@ -945,6 +945,12 @@ void CLR_RT_Assembly::DumpSignature(const CLR_UINT8 *&p)
             DumpSignature(p);
             break;
 
+        case DATATYPE_TYPE_FNPTR:
+            CLR_Debug::Printf("FNPTR(sig %04x) ", (CLR_UINT32)(p[0] | (p[1] << 8)));
+            p += 2;
+            DumpSignature(p);
+            break;
+
         default:
             CLR_Debug::Printf("[UNKNOWN: %08x]", opt);
             break;
@@ -1069,7 +1075,12 @@ void CLR_RT_Assembly::DumpOpcodeDirect(
         // If this is a CALL or CALLVIRT, force a MethodDef_Instance resolve and
         // use CLR_RT_DUMP::METHOD to print “TypeName::MethodName”. Otherwise fall
         // back to the existing DumpToken logic (fields, types, strings, etc.).
-        if (op == CEE_CALL || op == CEE_CALLVIRT)
+        if (op == CEE_CALLI)
+        {
+            // calli operand is a signature index, not a metadata token
+            CLR_Debug::Printf("sig %04x", token);
+        }
+        else if (op == CEE_CALL || op == CEE_CALLVIRT)
         {
             CLR_RT_MethodDef_Instance mdInst{};
             // Resolve the call token using the caller's assembly and generic context.

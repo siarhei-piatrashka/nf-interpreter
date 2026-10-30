@@ -480,6 +480,8 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
     res.Class.Clear();
     res.IsGenericInst = 0;
     res.GenParamCount = 0;
+    res.FnPtrAssembly = nullptr;
+    res.FnPtrSignature = nullptr;
 
     switch (Type)
     {
@@ -579,6 +581,17 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
                     case DATATYPE_SZARRAY:
                         res.Levels++;
                         break;
+
+                    case DATATYPE_TYPE_FNPTR:
+                    {
+                        // managed function pointer: keep its signature, the storage type follows
+                        CLR_SIG fnPtrSig = (CLR_SIG)(Signature[0] | (Signature[1] << 8));
+                        Signature += 2;
+
+                        res.FnPtrAssembly = Assembly;
+                        res.FnPtrSignature = Assembly->GetSignature(fnPtrSig);
+                    }
+                    break;
 
                     case DATATYPE_CLASS:
                     case DATATYPE_VALUETYPE:
@@ -1500,6 +1513,17 @@ bool CLR_RT_TypeDef_Instance::ResolveToken(
                                 return false;
                             }
                         }
+                        else if (NANOCLR_INDEX_IS_VALID(elem.Class))
+                        {
+                            // non generic TypeSpec (e.g. a managed function pointer type, encoded as I4)
+                            data = elem.Class.data;
+                            assembly = g_CLR_RT_TypeSystem.m_assemblies[elem.Class.Assembly() - 1];
+                            target = assembly->GetTypeDef(elem.Class.Type());
+                        }
+                        else
+                        {
+                            return false;
+                        }
                     }
                 }
 
@@ -2245,6 +2269,8 @@ bool CLR_RT_MethodDef_Instance::ResolveToken(
                                 {
                                     int argCount = openElem.GenParamCount;
                                     CLR_RT_TypeDef_Index resolvedArgs[8];
+                                    // array levels of each argument (e.g. T[] closed with int is int[], not int)
+                                    int resolvedLevels[8];
                                     bool allResolved = (argCount > 0 && argCount <= 8);
 
                                     for (int a = 0; a < argCount && allResolved; a++)
@@ -2255,6 +2281,8 @@ bool CLR_RT_MethodDef_Instance::ResolveToken(
                                             allResolved = false;
                                             break;
                                         }
+
+                                        resolvedLevels[a] = argElem.Levels;
 
                                         if (argElem.DataType == DATATYPE_MVAR)
                                         {
@@ -2278,6 +2306,7 @@ bool CLR_RT_MethodDef_Instance::ResolveToken(
                                                             NANOCLR_INDEX_IS_VALID(paramElem.Class))
                                                         {
                                                             resolvedArgs[a] = paramElem.Class;
+                                                            resolvedLevels[a] += paramElem.Levels;
                                                         }
                                                         else
                                                         {
@@ -2287,6 +2316,7 @@ bool CLR_RT_MethodDef_Instance::ResolveToken(
                                                     else if (NANOCLR_INDEX_IS_VALID(msArgElem.Class))
                                                     {
                                                         resolvedArgs[a] = msArgElem.Class;
+                                                        resolvedLevels[a] += msArgElem.Levels;
                                                     }
                                                     else
                                                     {
@@ -2323,6 +2353,7 @@ bool CLR_RT_MethodDef_Instance::ResolveToken(
                                                         paramElem))
                                                 {
                                                     resolvedArgs[a] = paramElem.Class;
+                                                    resolvedLevels[a] += paramElem.Levels;
                                                 }
                                                 else
                                                 {
@@ -2400,7 +2431,8 @@ bool CLR_RT_MethodDef_Instance::ResolveToken(
                                                         CLR_RT_SignatureParser::Element candidateArg{};
                                                         if (candidateInst.GetGenericParam(a, candidateArg))
                                                         {
-                                                            if (candidateArg.Class.data != resolvedArgs[a].data)
+                                                            if (candidateArg.Class.data != resolvedArgs[a].data ||
+                                                                candidateArg.Levels != resolvedLevels[a])
                                                             {
                                                                 argsMatch = false;
                                                             }
@@ -7318,6 +7350,11 @@ void CLR_RT_TypeSystem::TypeSystem_Initialize()
     g_CLR_RT_TypeSystem.m_genericCctorRegistry = nullptr;
     g_CLR_RT_TypeSystem.m_genericCctorRegistryCount = 0;
     g_CLR_RT_TypeSystem.m_genericCctorRegistryMaxCount = 0;
+
+    // Initialize function pointer registry
+    g_CLR_RT_TypeSystem.m_functionPointers = nullptr;
+    g_CLR_RT_TypeSystem.m_functionPointersCount = 0;
+    g_CLR_RT_TypeSystem.m_functionPointersMaxCount = 0;
 }
 
 void CLR_RT_TypeSystem::TypeSystem_Cleanup()
@@ -7360,6 +7397,1082 @@ void CLR_RT_TypeSystem::TypeSystem_Cleanup()
         m_genericCctorRegistryCount = 0;
         m_genericCctorRegistryMaxCount = 0;
     }
+
+    // Clean up function pointer registry
+#if NANOCLR_CALLI_VALIDATION_CACHE_SIZE > 0
+    memset(m_calliValidated, 0, sizeof(m_calliValidated));
+#endif
+
+    if (m_functionPointers != nullptr)
+    {
+        platform_free(m_functionPointers);
+        m_functionPointers = nullptr;
+        m_functionPointersCount = 0;
+        m_functionPointersMaxCount = 0;
+    }
+}
+
+//--//
+
+//
+// Managed function pointers (C# 'delegate*<...>', IL 'ldftn'/'ldvirtftn') are I4 values:
+//  - non generic target: the CLR_RT_MethodDef_Index of the method (bit 31 is never set, assembly index is >= 1)
+//  - generic instantiation: c_FunctionPointerGenericFlag | index of a record in the function pointer registry,
+//    holding the generic context (TypeSpec and/or MethodSpec). Records are interned, so the same
+//    instantiation always yields the same value and the native memory is only allocated once per instantiation.
+//    When the instantiation is open (uses VAR/MVAR of the method taking the address) the generic context of that
+//    method is kept too, so the target is resolved exactly as a direct call from that method would be.
+// 0 is the null function pointer.
+//
+
+// consumes one type from the parser, returns true if it references a generic parameter (VAR/MVAR)
+static bool FunctionPointer_TypeHasGenericParameter(CLR_RT_SignatureParser &parser)
+{
+    CLR_RT_SignatureParser::Element elem{};
+
+    if (FAILED(parser.Advance(elem)))
+    {
+        // malformed: treat as open, keeping the context is always safe
+        return true;
+    }
+
+    if (elem.DataType == DATATYPE_VAR || elem.DataType == DATATYPE_MVAR)
+    {
+        return true;
+    }
+
+    if (elem.DataType == DATATYPE_GENERICINST)
+    {
+        // skip the generic type definition
+        if (FAILED(parser.Advance(elem)))
+        {
+            return true;
+        }
+
+        int count = elem.GenParamCount;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (FunctionPointer_TypeHasGenericParameter(parser))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool FunctionPointer_IsOpenInstantiation(const CLR_RT_FunctionPointerRecord &record)
+{
+    if (NANOCLR_INDEX_IS_VALID(record.m_genericType))
+    {
+        CLR_RT_TypeSpec_Instance tsInst{};
+
+        if (!tsInst.InitializeFromIndex(record.m_genericType))
+        {
+            return true;
+        }
+
+        CLR_RT_SignatureParser parser{};
+        parser.Initialize_TypeSpec(tsInst);
+
+        if (FunctionPointer_TypeHasGenericParameter(parser))
+        {
+            return true;
+        }
+    }
+
+    if (NANOCLR_INDEX_IS_VALID(record.m_methodSpec))
+    {
+        CLR_RT_MethodSpec_Instance msInst{};
+
+        if (!msInst.InitializeFromIndex(record.m_methodSpec))
+        {
+            return true;
+        }
+
+        CLR_RT_SignatureParser parser{};
+        parser.Initialize_MethodSignature(&msInst);
+
+        for (int i = 0; i < parser.ParamCount; i++)
+        {
+            if (FunctionPointer_TypeHasGenericParameter(parser))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// consumes one complete type from the parser
+static bool FunctionPointer_SkipType(CLR_RT_SignatureParser &parser)
+{
+    CLR_RT_SignatureParser::Element elem{};
+
+    if (FAILED(parser.Advance(elem)))
+    {
+        return false;
+    }
+
+    if (elem.DataType == DATATYPE_GENERICINST)
+    {
+        // generic type definition, followed by the generic arguments
+        if (FAILED(parser.Advance(elem)))
+        {
+            return false;
+        }
+
+        int count = elem.GenParamCount;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!FunctionPointer_SkipType(parser))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// generic context used to resolve VAR/MVAR of a function pointer record
+struct FunctionPointer_GenericContext
+{
+    CLR_RT_TypeSpec_Index genericType;
+    CLR_RT_MethodSpec_Index methodSpec;
+};
+
+// positions the parser on the generic argument (VAR or MVAR) at the given position of the context
+static bool FunctionPointer_PositionOnGenericArgument(
+    const FunctionPointer_GenericContext &context,
+    NanoCLRDataType dataType,
+    CLR_INDEX position,
+    CLR_RT_SignatureParser &parser)
+{
+    int count;
+
+    if (dataType == DATATYPE_VAR)
+    {
+        CLR_RT_TypeSpec_Instance tsInst{};
+        CLR_RT_SignatureParser::Element elem{};
+
+        if (!NANOCLR_INDEX_IS_VALID(context.genericType) || !tsInst.InitializeFromIndex(context.genericType))
+        {
+            return false;
+        }
+
+        parser.Initialize_TypeSpec(tsInst);
+
+        // GENERICINST, then generic type definition with the argument count
+        if (FAILED(parser.Advance(elem)) || elem.DataType != DATATYPE_GENERICINST || FAILED(parser.Advance(elem)))
+        {
+            return false;
+        }
+
+        count = elem.GenParamCount;
+    }
+    else
+    {
+        CLR_RT_MethodSpec_Instance msInst{};
+
+        if (!NANOCLR_INDEX_IS_VALID(context.methodSpec) || !msInst.InitializeFromIndex(context.methodSpec))
+        {
+            return false;
+        }
+
+        parser.Initialize_MethodSignature(&msInst);
+
+        count = parser.ParamCount;
+    }
+
+    if (position >= count)
+    {
+        return false;
+    }
+
+    for (int i = 0; i < position; i++)
+    {
+        if (!FunctionPointer_SkipType(parser))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// reads the next type, substituting VAR/MVAR with the type of the generic context
+// 'active' is the parser the remaining of the type (generic arguments) has to be read from
+static bool FunctionPointer_ReadResolvedType(
+    CLR_RT_SignatureParser &parser,
+    const FunctionPointer_GenericContext &context,
+    CLR_RT_SignatureParser &storage,
+    CLR_RT_SignatureParser *&active,
+    CLR_RT_SignatureParser::Element &elem,
+    int &levels)
+{
+    active = &parser;
+
+    if (FAILED(parser.Advance(elem)))
+    {
+        return false;
+    }
+
+    levels = elem.Levels;
+
+    // the context arguments are closed, a method argument can reference a type argument of the context though
+    for (int i = 0; i < 2 && (elem.DataType == DATATYPE_VAR || elem.DataType == DATATYPE_MVAR); i++)
+    {
+        if (!FunctionPointer_PositionOnGenericArgument(context, elem.DataType, elem.GenericParamPosition, storage))
+        {
+            return false;
+        }
+
+        active = &storage;
+
+        if (FAILED(storage.Advance(elem)))
+        {
+            return false;
+        }
+
+        levels += elem.Levels;
+    }
+
+    return elem.DataType != DATATYPE_VAR && elem.DataType != DATATYPE_MVAR;
+}
+
+// consumes one type from each parser, returns true if both are the same closed type
+static bool FunctionPointer_SameType(
+    CLR_RT_SignatureParser &parserLeft,
+    const FunctionPointer_GenericContext &contextLeft,
+    CLR_RT_SignatureParser &parserRight,
+    const FunctionPointer_GenericContext &contextRight,
+    int depth)
+{
+    CLR_RT_SignatureParser storageLeft{};
+    CLR_RT_SignatureParser storageRight{};
+    CLR_RT_SignatureParser *activeLeft;
+    CLR_RT_SignatureParser *activeRight;
+    CLR_RT_SignatureParser::Element left{};
+    CLR_RT_SignatureParser::Element right{};
+    int levelsLeft;
+    int levelsRight;
+
+    if (depth > 8)
+    {
+        return false;
+    }
+
+    if (!FunctionPointer_ReadResolvedType(parserLeft, contextLeft, storageLeft, activeLeft, left, levelsLeft) ||
+        !FunctionPointer_ReadResolvedType(parserRight, contextRight, storageRight, activeRight, right, levelsRight))
+    {
+        return false;
+    }
+
+    if (levelsLeft != levelsRight || left.IsByRef != right.IsByRef || left.DataType != right.DataType)
+    {
+        return false;
+    }
+
+    if (left.DataType != DATATYPE_GENERICINST)
+    {
+        return left.Class.data == right.Class.data;
+    }
+
+    // generic type definitions and arguments
+    if (FAILED(activeLeft->Advance(left)) || FAILED(activeRight->Advance(right)) ||
+        left.Class.data != right.Class.data || left.GenParamCount != right.GenParamCount)
+    {
+        return false;
+    }
+
+    for (int i = 0; i < left.GenParamCount; i++)
+    {
+        if (!FunctionPointer_SameType(*activeLeft, contextLeft, *activeRight, contextRight, depth + 1))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void FunctionPointer_CompleteContext(FunctionPointer_GenericContext &context);
+
+// generic context of the method that took the address of a function pointer record
+static void FunctionPointer_GetProducerContext(
+    const CLR_RT_FunctionPointerRecord &record,
+    FunctionPointer_GenericContext &context)
+{
+    context.genericType = record.m_producerGenericType;
+    context.methodSpec = record.m_producerMethodSpec;
+
+    FunctionPointer_CompleteContext(context);
+}
+
+// generic method of a generic type: the type context is the type containing the method specification
+static void FunctionPointer_CompleteContext(FunctionPointer_GenericContext &context)
+{
+    if (!NANOCLR_INDEX_IS_VALID(context.genericType) && NANOCLR_INDEX_IS_VALID(context.methodSpec))
+    {
+        CLR_RT_MethodSpec_Instance msInst{};
+
+        if (msInst.InitializeFromIndex(context.methodSpec) && msInst.target->container != CLR_EmptyIndex &&
+            msInst.target->container < (CLR_UINT16)msInst.assembly->tablesSize[TBL_TypeSpec])
+        {
+            context.genericType = msInst.assembly->crossReferenceTypeSpec[msInst.target->container].genericType;
+        }
+    }
+}
+
+// returns true if both records target the same generic instantiation of the same method, regardless of the
+// assembly (TypeSpec/MethodSpec tables) or of the generic context they come from
+static bool FunctionPointer_SameInstantiation(
+    const CLR_RT_FunctionPointerRecord &left,
+    const CLR_RT_FunctionPointerRecord &right)
+{
+    FunctionPointer_GenericContext contextLeft;
+    FunctionPointer_GenericContext contextRight;
+
+    if (left.m_method.data != right.m_method.data ||
+        NANOCLR_INDEX_IS_VALID(left.m_genericType) != NANOCLR_INDEX_IS_VALID(right.m_genericType) ||
+        NANOCLR_INDEX_IS_VALID(left.m_methodSpec) != NANOCLR_INDEX_IS_VALID(right.m_methodSpec))
+    {
+        return false;
+    }
+
+    FunctionPointer_GetProducerContext(left, contextLeft);
+    FunctionPointer_GetProducerContext(right, contextRight);
+
+    if (NANOCLR_INDEX_IS_VALID(left.m_genericType))
+    {
+        CLR_RT_TypeSpec_Instance tsLeft{};
+        CLR_RT_TypeSpec_Instance tsRight{};
+
+        if (!tsLeft.InitializeFromIndex(left.m_genericType) || !tsRight.InitializeFromIndex(right.m_genericType))
+        {
+            return false;
+        }
+
+        CLR_RT_SignatureParser parserLeft{};
+        CLR_RT_SignatureParser parserRight{};
+
+        parserLeft.Initialize_TypeSpec(tsLeft);
+        parserRight.Initialize_TypeSpec(tsRight);
+
+        if (!FunctionPointer_SameType(parserLeft, contextLeft, parserRight, contextRight, 0))
+        {
+            return false;
+        }
+    }
+
+    if (NANOCLR_INDEX_IS_VALID(left.m_methodSpec))
+    {
+        CLR_RT_MethodSpec_Instance msLeft{};
+        CLR_RT_MethodSpec_Instance msRight{};
+
+        if (!msLeft.InitializeFromIndex(left.m_methodSpec) || !msRight.InitializeFromIndex(right.m_methodSpec))
+        {
+            return false;
+        }
+
+        CLR_RT_SignatureParser parserLeft{};
+        CLR_RT_SignatureParser parserRight{};
+
+        parserLeft.Initialize_MethodSignature(&msLeft);
+        parserRight.Initialize_MethodSignature(&msRight);
+
+        if (parserLeft.ParamCount != parserRight.ParamCount)
+        {
+            return false;
+        }
+
+        for (int i = 0, count = parserLeft.ParamCount; i < count; i++)
+        {
+            if (!FunctionPointer_SameType(parserLeft, contextLeft, parserRight, contextRight, 0))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+HRESULT CLR_RT_TypeSystem::GetFunctionPointer(
+    const CLR_RT_MethodDef_Instance &method,
+    const CLR_RT_MethodDef_Instance *producer,
+    CLR_UINT32 &value)
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    // fast path: non generic method, the value is the method index
+    if ((method.genericType == nullptr || !NANOCLR_INDEX_IS_VALID(*method.genericType)) &&
+        !NANOCLR_INDEX_IS_VALID(method.methodSpec))
+    {
+        value = method.data;
+        return S_OK;
+    }
+
+    NANOCLR_HEADER();
+
+    CLR_RT_FunctionPointerRecord record;
+
+    record.m_method.data = method.data;
+    record.m_genericType.Clear();
+    record.m_methodSpec = method.methodSpec;
+    record.m_producerGenericType.Clear();
+    record.m_producerMethodSpec.Clear();
+
+    if (method.genericType != nullptr && NANOCLR_INDEX_IS_VALID(*method.genericType))
+    {
+        record.m_genericType = *method.genericType;
+    }
+
+    if (!NANOCLR_INDEX_IS_VALID(record.m_genericType) && !NANOCLR_INDEX_IS_VALID(record.m_methodSpec))
+    {
+        value = record.m_method.data;
+        NANOCLR_SET_AND_LEAVE(S_OK);
+    }
+
+    if (producer != nullptr && FunctionPointer_IsOpenInstantiation(record))
+    {
+        if (producer->genericType != nullptr && NANOCLR_INDEX_IS_VALID(*producer->genericType))
+        {
+            record.m_producerGenericType = *producer->genericType;
+        }
+
+        record.m_producerMethodSpec = producer->methodSpec;
+    }
+
+    for (CLR_UINT32 i = 0; i < m_functionPointersCount; i++)
+    {
+        const CLR_RT_FunctionPointerRecord &existing = m_functionPointers[i];
+
+        if (existing.m_method.data == record.m_method.data &&
+            existing.m_genericType.data == record.m_genericType.data &&
+            existing.m_methodSpec.data == record.m_methodSpec.data &&
+            existing.m_producerGenericType.data == record.m_producerGenericType.data &&
+            existing.m_producerMethodSpec.data == record.m_producerMethodSpec.data)
+        {
+            value = c_FunctionPointerGenericFlag | i;
+            NANOCLR_SET_AND_LEAVE(S_OK);
+        }
+    }
+
+    // same instantiation reached from another assembly or generic context: function pointers to the same
+    // method instantiation have to compare equal
+    for (CLR_UINT32 i = 0; i < m_functionPointersCount; i++)
+    {
+        if (FunctionPointer_SameInstantiation(m_functionPointers[i], record))
+        {
+            value = c_FunctionPointerGenericFlag | i;
+            NANOCLR_SET_AND_LEAVE(S_OK);
+        }
+    }
+
+    if (m_functionPointersCount >= m_functionPointersMaxCount)
+    {
+        CLR_UINT32 newMax = m_functionPointersMaxCount == 0 ? 4 : m_functionPointersMaxCount * 2;
+
+        CLR_RT_FunctionPointerRecord *newArray =
+            (CLR_RT_FunctionPointerRecord *)platform_malloc(sizeof(CLR_RT_FunctionPointerRecord) * newMax);
+
+        if (newArray == nullptr)
+        {
+            NANOCLR_SET_AND_LEAVE(CLR_E_OUT_OF_MEMORY);
+        }
+
+        if (m_functionPointers != nullptr)
+        {
+            memcpy(newArray, m_functionPointers, sizeof(CLR_RT_FunctionPointerRecord) * m_functionPointersCount);
+
+            platform_free(m_functionPointers);
+        }
+
+        m_functionPointers = newArray;
+        m_functionPointersMaxCount = newMax;
+    }
+
+    m_functionPointers[m_functionPointersCount] = record;
+    value = c_FunctionPointerGenericFlag | m_functionPointersCount;
+    m_functionPointersCount++;
+
+    NANOCLR_NOCLEANUP();
+}
+
+HRESULT CLR_RT_TypeSystem::ResolveFunctionPointer(CLR_UINT32 value, CLR_RT_MethodDef_Instance &method)
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    // the value can be forged by user code, so it's fully validated before being used
+    if (value == 0)
+    {
+        return CLR_E_NULL_REFERENCE;
+    }
+
+    // non generic method: the value is the method index
+    if ((value & c_FunctionPointerGenericFlag) == 0)
+    {
+        CLR_RT_MethodDef_Index index;
+        index.data = value;
+        CLR_UINT32 idx = index.Assembly();
+
+        if (idx == 0 || idx > m_assembliesMax || m_assemblies[idx - 1] == nullptr ||
+            index.Method() >= m_assemblies[idx - 1]->tablesSize[TBL_MethodDef] ||
+            method.InitializeFromIndex(index) == false)
+        {
+            return CLR_E_WRONG_TYPE;
+        }
+
+        return S_OK;
+    }
+
+    NANOCLR_HEADER();
+
+    CLR_RT_FunctionPointerRecord record;
+    CLR_RT_MethodDef_Instance producer{};
+    CLR_RT_Assembly *targetAssm;
+    CLR_UINT32 assmIdx;
+    CLR_UINT32 registryIndex = value & ~c_FunctionPointerGenericFlag;
+
+    if (registryIndex >= m_functionPointersCount)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    record = m_functionPointers[registryIndex];
+
+    assmIdx = record.m_method.Assembly();
+
+    if (assmIdx == 0 || assmIdx > m_assembliesMax)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    targetAssm = m_assemblies[assmIdx - 1];
+
+    if (targetAssm == nullptr || record.m_method.Method() >= targetAssm->tablesSize[TBL_MethodDef])
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    // generic context of the method that took the address (only kept for open instantiations)
+    producer.ClearInstance();
+    producer.methodSpec = record.m_producerMethodSpec;
+
+    if (NANOCLR_INDEX_IS_VALID(record.m_producerGenericType))
+    {
+        producer.m_typeSpecStorage = record.m_producerGenericType;
+        producer.genericType = &producer.m_typeSpecStorage;
+    }
+
+    if (NANOCLR_INDEX_IS_VALID(record.m_genericType))
+    {
+        if (method.InitializeFromIndex(record.m_method, record.m_genericType, &producer) == false)
+        {
+            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+        }
+    }
+    else if (method.InitializeFromIndex(record.m_method) == false)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    method.methodSpec = record.m_methodSpec;
+
+    // same as a direct call: a method of an open generic type without its own MethodSpec resolves MVAR with the
+    // MethodSpec of the method that took the address
+    if (!NANOCLR_INDEX_IS_VALID(method.methodSpec) && NANOCLR_INDEX_IS_VALID(record.m_producerMethodSpec))
+    {
+        method.methodSpec = record.m_producerMethodSpec;
+    }
+
+    NANOCLR_NOCLEANUP();
+}
+
+//--//
+
+//
+// CALLI signature validation: the call site signature (resolved in the generic context of the calling method) has to
+// match the signature of the target (resolved in its own generic context), as for a direct call.
+//
+
+// generic contexts used to resolve VAR/MVAR of a signature: level 0 for the signature itself, level 1 for the generic
+// arguments of the level 0 context (open instantiations reference the generic parameters of the method that produced
+// them)
+struct FunctionPointer_CallContext
+{
+    FunctionPointer_GenericContext level[2];
+};
+
+static void FunctionPointer_GetMethodContext(
+    const CLR_RT_MethodDef_Instance &method,
+    FunctionPointer_GenericContext &context)
+{
+    context.genericType.Clear();
+
+    if (method.genericType != nullptr)
+    {
+        context.genericType = *method.genericType;
+    }
+
+    context.methodSpec = method.methodSpec;
+
+    FunctionPointer_CompleteContext(context);
+}
+
+// walks the elements of a method signature, in signature order, substituting VAR/MVAR with the generic context and
+// entering nested function pointer signatures (no recursion: each substitution or nested signature uses a frame with
+// its own parser, so the native stack usage is bounded)
+struct FunctionPointer_TypeWalker
+{
+    static const int c_MaxFrames = 8;
+
+    const FunctionPointer_CallContext *context;
+    CLR_RT_SignatureParser *parser[c_MaxFrames];
+    int level[c_MaxFrames];
+    int remaining[c_MaxFrames];
+    // frame of a nested function pointer signature (or of a substitution inside one)
+    bool nested[c_MaxFrames];
+    int count;
+    CLR_RT_SignatureParser storage[c_MaxFrames];
+
+    void Initialize(CLR_RT_SignatureParser &root, const FunctionPointer_CallContext &callContext)
+    {
+        context = &callContext;
+        parser[0] = &root;
+        level[0] = 0;
+        remaining[0] = root.Available();
+        nested[0] = false;
+        count = 1;
+    }
+
+    bool HasMore()
+    {
+        while (count > 1 && remaining[count - 1] == 0)
+        {
+            count--;
+        }
+
+        return remaining[count - 1] > 0;
+    }
+
+    // returns the parser of a new frame, nullptr if there are too many
+    CLR_RT_SignatureParser *Push(int frameLevel, bool isNested)
+    {
+        if (count >= c_MaxFrames)
+        {
+            return nullptr;
+        }
+
+        int top = count++;
+
+        parser[top] = &storage[top];
+        level[top] = frameLevel;
+        remaining[top] = 0;
+        nested[top] = isNested;
+
+        return parser[top];
+    }
+};
+
+// one element of a type, after VAR/MVAR substitution
+struct FunctionPointer_CallElement
+{
+    CLR_RT_SignatureParser::Element elem;
+    CLR_RT_SignatureParser::Element definition;
+    int levels;
+    int contextLevel;
+    bool isByRef;
+    bool isSubstituted;
+    bool isNested;
+};
+
+// returns false if the signature is malformed or if a generic parameter can't be resolved
+static bool FunctionPointer_NextCallElement(FunctionPointer_TypeWalker &walker, FunctionPointer_CallElement &result)
+{
+    result.isSubstituted = false;
+    result.contextLevel = 0;
+
+    if (!walker.HasMore())
+    {
+        return false;
+    }
+
+    int top = walker.count - 1;
+
+    walker.remaining[top]--;
+
+    if (FAILED(walker.parser[top]->Advance(result.elem)))
+    {
+        return false;
+    }
+
+    result.levels = result.elem.Levels;
+    result.isByRef = result.elem.IsByRef;
+    result.isSubstituted = false;
+    result.contextLevel = walker.level[top];
+
+    while (result.elem.DataType == DATATYPE_VAR || result.elem.DataType == DATATYPE_MVAR)
+    {
+        // the generic arguments of the level 1 context are closed or reference the level 1 context itself
+        // (a generic argument is never resolved more than twice: deeper means a malformed signature)
+        if (result.contextLevel >= 2)
+        {
+            return false;
+        }
+
+        NanoCLRDataType dataType = result.elem.DataType;
+        CLR_INDEX position = result.elem.GenericParamPosition;
+        int contextLevel = result.contextLevel;
+        CLR_RT_SignatureParser *storage = walker.Push(contextLevel + 1, walker.nested[walker.count - 1]);
+
+        if (storage == nullptr || !FunctionPointer_PositionOnGenericArgument(
+                                      walker.context->level[contextLevel],
+                                      dataType,
+                                      position,
+                                      *storage))
+        {
+            return false;
+        }
+
+        top = walker.count - 1;
+
+        if (FAILED(storage->Advance(result.elem)))
+        {
+            return false;
+        }
+
+        result.levels += result.elem.Levels;
+        result.isByRef = result.isByRef || result.elem.IsByRef;
+        result.isSubstituted = true;
+        result.contextLevel = walker.level[top];
+    }
+
+    result.isNested = walker.nested[top];
+
+    if (result.elem.DataType == DATATYPE_GENERICINST)
+    {
+        // generic type definition, followed by its generic arguments
+        if (FAILED(walker.parser[top]->Advance(result.definition)) || result.definition.GenParamCount <= 0)
+        {
+            return false;
+        }
+
+        walker.remaining[top] += result.definition.GenParamCount;
+    }
+
+    return true;
+}
+
+// a type of a call site and the corresponding type of the target are compatible if they are identical or, for top
+// level types passed by value, if there is an implicit reference conversion between them (as for the C# conversions of
+// method groups and function pointers: parameters are contravariant, the return type is covariant)
+static bool FunctionPointer_IsReferenceElement(const FunctionPointer_CallElement &element)
+{
+    CLR_RT_TypeDef_Instance inst{};
+    const CLR_RT_TypeDef_Index *cls = &element.elem.Class;
+
+    switch (element.elem.DataType)
+    {
+        case DATATYPE_CLASS:
+        case DATATYPE_STRING:
+        case DATATYPE_OBJECT:
+            if (element.elem.FnPtrSignature != nullptr && !element.isSubstituted)
+            {
+                return false;
+            }
+            break;
+
+        case DATATYPE_GENERICINST:
+            if (element.definition.DataType != DATATYPE_CLASS)
+            {
+                return false;
+            }
+
+            cls = &element.definition.Class;
+            break;
+
+        default:
+            return false;
+    }
+
+    if (!NANOCLR_INDEX_IS_VALID(*cls) || !inst.InitializeFromIndex(*cls))
+    {
+        return false;
+    }
+
+    switch (inst.target->flags & CLR_RECORD_TYPEDEF::TD_Semantics_Mask)
+    {
+        case CLR_RECORD_TYPEDEF::TD_Semantics_Class:
+        case CLR_RECORD_TYPEDEF::TD_Semantics_Interface:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool FunctionPointer_IsReferenceConversion(
+    const FunctionPointer_CallElement &from,
+    const FunctionPointer_CallElement &to)
+{
+    // conversions to generic types (generic variance) aren't supported, as for casts
+    if (from.isByRef || to.isByRef || to.levels > from.levels || to.elem.DataType == DATATYPE_GENERICINST ||
+        !NANOCLR_INDEX_IS_VALID(to.elem.Class))
+    {
+        return false;
+    }
+
+    if (from.levels > to.levels)
+    {
+        // an array (element of the array) to System.Object, System.Array or one of its interfaces
+        return to.elem.Class.data == g_CLR_RT_WellKnownTypes.Object.data ||
+               CLR_RT_ExecutionEngine::IsInstanceOf(g_CLR_RT_WellKnownTypes.Array, to.elem.Class);
+    }
+
+    // same rank: reference types only (arrays are covariant for reference element types)
+    if (!FunctionPointer_IsReferenceElement(from) || !FunctionPointer_IsReferenceElement(to))
+    {
+        return false;
+    }
+
+    if (to.elem.Class.data == g_CLR_RT_WellKnownTypes.Object.data)
+    {
+        return true;
+    }
+
+    return CLR_RT_ExecutionEngine::IsInstanceOf(
+        from.elem.DataType == DATATYPE_GENERICINST ? from.definition.Class : from.elem.Class,
+        to.elem.Class);
+}
+
+// consumes the generic arguments of a top level type
+static bool FunctionPointer_SkipGenericArguments(FunctionPointer_TypeWalker &walker, int &pending, bool &contextUsed)
+{
+    FunctionPointer_CallElement element;
+
+    while (pending > 0)
+    {
+        if (!FunctionPointer_NextCallElement(walker, element))
+        {
+            return false;
+        }
+
+        if (element.isSubstituted || element.contextLevel > 0)
+        {
+            contextUsed = true;
+        }
+
+        pending--;
+
+        if (element.elem.DataType == DATATYPE_GENERICINST)
+        {
+            pending += element.definition.GenParamCount;
+        }
+    }
+
+    return true;
+}
+
+// compares the return type and the parameters of two method signatures, returns true if they resolve to compatible
+// types
+static bool FunctionPointer_CompareCallSignature(
+    CLR_RT_SignatureParser &callSite,
+    const FunctionPointer_CallContext &callSiteContext,
+    CLR_RT_SignatureParser &target,
+    const FunctionPointer_CallContext &targetContext,
+    bool &callSiteContextUsed)
+{
+    FunctionPointer_TypeWalker walkerLeft;
+    FunctionPointer_TypeWalker walkerRight;
+    FunctionPointer_CallElement left;
+    FunctionPointer_CallElement right;
+    // generic arguments still to be consumed for the current top level type
+    int pendingLeft = 0;
+    int pendingRight = 0;
+    // the return type is the first top level type
+    bool isReturn = true;
+    bool unusedContext = false;
+
+    walkerLeft.Initialize(callSite, callSiteContext);
+    walkerRight.Initialize(target, targetContext);
+
+    // each complete type consumes one from the parser count, generic arguments included
+    if (walkerLeft.remaining[0] != walkerRight.remaining[0] || walkerLeft.remaining[0] <= 0)
+    {
+        return false;
+    }
+
+    while (walkerLeft.HasMore() || walkerRight.HasMore())
+    {
+        bool okLeft = FunctionPointer_NextCallElement(walkerLeft, left);
+
+        if (left.isSubstituted || left.contextLevel > 0)
+        {
+            callSiteContextUsed = true;
+        }
+
+        if (!okLeft || !FunctionPointer_NextCallElement(walkerRight, right))
+        {
+            return false;
+        }
+
+        // top level type (not a generic argument, nor a type of a nested function pointer signature)
+        bool isTopLevel = !left.isNested && !right.isNested && pendingLeft == 0 && pendingRight == 0;
+        bool isReturnType = isTopLevel && isReturn;
+
+        if (isTopLevel)
+        {
+            isReturn = false;
+        }
+
+        if (!left.isNested && pendingLeft > 0)
+        {
+            pendingLeft--;
+        }
+
+        if (!right.isNested && pendingRight > 0)
+        {
+            pendingRight--;
+        }
+
+        if (!left.isNested && left.elem.DataType == DATATYPE_GENERICINST)
+        {
+            pendingLeft += left.definition.GenParamCount;
+        }
+
+        if (!right.isNested && right.elem.DataType == DATATYPE_GENERICINST)
+        {
+            pendingRight += right.definition.GenParamCount;
+        }
+
+        bool isIdentical =
+            left.levels == right.levels && left.isByRef == right.isByRef && left.elem.DataType == right.elem.DataType;
+
+        if (isIdentical && left.elem.DataType == DATATYPE_GENERICINST)
+        {
+            isIdentical = left.definition.DataType == right.definition.DataType &&
+                          NANOCLR_INDEX_IS_VALID(left.definition.Class) &&
+                          left.definition.Class.data == right.definition.Class.data &&
+                          left.definition.GenParamCount == right.definition.GenParamCount;
+        }
+        else if (isIdentical)
+        {
+            // a type that isn't resolved to a TypeDef (TypeSpec token) can't be compared
+            isIdentical = NANOCLR_INDEX_IS_VALID(left.elem.Class) && left.elem.Class.data == right.elem.Class.data;
+        }
+
+        if (!isIdentical)
+        {
+            if (!isTopLevel || (isReturnType ? !FunctionPointer_IsReferenceConversion(right, left)
+                                             : !FunctionPointer_IsReferenceConversion(left, right)))
+            {
+                return false;
+            }
+
+            // compatible types: their generic arguments aren't compared
+            if (!FunctionPointer_SkipGenericArguments(walkerLeft, pendingLeft, callSiteContextUsed) ||
+                !FunctionPointer_SkipGenericArguments(walkerRight, pendingRight, unusedContext))
+            {
+                return false;
+            }
+
+            continue;
+        }
+
+        if (left.elem.DataType == DATATYPE_GENERICINST)
+        {
+            continue;
+        }
+
+        // managed function pointers are stored as I4, so their signatures have to match too
+        // (generic arguments don't carry the signature of a function pointer)
+        if (left.isSubstituted || right.isSubstituted)
+        {
+            continue;
+        }
+
+        if ((left.elem.FnPtrSignature == nullptr) != (right.elem.FnPtrSignature == nullptr))
+        {
+            return false;
+        }
+
+        if (left.elem.FnPtrSignature != nullptr)
+        {
+            // nested function pointer signature: compared in the generic context of the element (the same blob can
+            // resolve to different types, so it's always walked)
+            CLR_RT_SignatureParser *fnPtrLeft = walkerLeft.Push(left.contextLevel, true);
+            CLR_RT_SignatureParser *fnPtrRight = walkerRight.Push(right.contextLevel, true);
+
+            if (fnPtrLeft == nullptr || fnPtrRight == nullptr)
+            {
+                return false;
+            }
+
+            fnPtrLeft->Initialize_MethodSignature(left.elem.FnPtrAssembly, left.elem.FnPtrSignature);
+            fnPtrRight->Initialize_MethodSignature(right.elem.FnPtrAssembly, right.elem.FnPtrSignature);
+
+            if (fnPtrLeft->Flags != fnPtrRight->Flags || fnPtrLeft->Available() != fnPtrRight->Available() ||
+                fnPtrLeft->Available() <= 0)
+            {
+                return false;
+            }
+
+            walkerLeft.remaining[walkerLeft.count - 1] = fnPtrLeft->Available();
+            walkerRight.remaining[walkerRight.count - 1] = fnPtrRight->Available();
+        }
+    }
+
+    return callSite.Available() == 0 && target.Available() == 0;
+}
+
+bool CLR_RT_TypeSystem::MatchCallISignature(
+    CLR_RT_SignatureParser &callSite,
+    const CLR_RT_MethodDef_Instance &caller,
+    CLR_RT_SignatureParser &target,
+    const CLR_RT_MethodDef_Instance &targetMethod,
+    CLR_UINT32 functionPointer,
+    bool &callerContextUsed)
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    FunctionPointer_CallContext callerContext;
+    FunctionPointer_CallContext targetContext;
+
+    FunctionPointer_GetMethodContext(caller, callerContext.level[0]);
+    callerContext.level[1] = callerContext.level[0];
+
+    FunctionPointer_GetMethodContext(targetMethod, targetContext.level[0]);
+    targetContext.level[1] = targetContext.level[0];
+
+    // open generic instantiation: its generic arguments reference the generic parameters of the method that took
+    // the address (the value has already been validated by ResolveFunctionPointer)
+    if ((functionPointer & c_FunctionPointerGenericFlag) != 0)
+    {
+        CLR_UINT32 registryIndex = functionPointer & ~c_FunctionPointerGenericFlag;
+
+        if (registryIndex >= m_functionPointersCount)
+        {
+            return false;
+        }
+
+        const CLR_RT_FunctionPointerRecord &record = m_functionPointers[registryIndex];
+
+        if (NANOCLR_INDEX_IS_VALID(record.m_producerGenericType) || NANOCLR_INDEX_IS_VALID(record.m_producerMethodSpec))
+        {
+            FunctionPointer_GetProducerContext(record, targetContext.level[1]);
+        }
+    }
+
+    callerContextUsed = false;
+
+    return FunctionPointer_CompareCallSignature(callSite, callerContext, target, targetContext, callerContextUsed);
 }
 
 //--//
@@ -8205,6 +9318,26 @@ bool CLR_RT_TypeSystem::MatchSignatureElement(
         if (resLeft.Class.data != resRight.Class.data)
         {
             return false;
+        }
+
+        // managed function pointers are stored as I4, so their signatures have to match too
+        if ((resLeft.FnPtrSignature == nullptr) != (resRight.FnPtrSignature == nullptr))
+        {
+            return false;
+        }
+
+        if (resLeft.FnPtrSignature != nullptr && resLeft.FnPtrSignature != resRight.FnPtrSignature)
+        {
+            CLR_RT_SignatureParser fnPtrParserLeft{};
+            CLR_RT_SignatureParser fnPtrParserRight{};
+
+            fnPtrParserLeft.Initialize_MethodSignature(resLeft.FnPtrAssembly, resLeft.FnPtrSignature);
+            fnPtrParserRight.Initialize_MethodSignature(resRight.FnPtrAssembly, resRight.FnPtrSignature);
+
+            if (!MatchSignature(fnPtrParserLeft, fnPtrParserRight))
+            {
+                return false;
+            }
         }
 
         if ((resLeft.DataType == DATATYPE_MVAR && resRight.DataType == DATATYPE_MVAR) &&

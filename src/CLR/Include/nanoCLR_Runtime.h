@@ -1207,6 +1207,10 @@ struct CLR_RT_SignatureParser
 
         /// @brief Generic parameters count
         int GenParamCount;
+
+        /// @brief Assembly and signature of a managed function pointer (only available in method signatures)
+        CLR_RT_Assembly *FnPtrAssembly;
+        CLR_PMETADATA FnPtrSignature;
     };
 
     CLR_RT_HeapBlock *ObjectList;
@@ -2037,6 +2041,41 @@ struct CLR_RT_GenericCctorExecutionRecord
 
 //--//
 
+// Generic instantiation targeted by a managed function pointer (see CLR_RT_TypeSystem::GetFunctionPointer)
+struct CLR_RT_FunctionPointerRecord
+{
+    CLR_RT_MethodDef_Index m_method;
+    CLR_RT_TypeSpec_Index m_genericType;
+    CLR_RT_MethodSpec_Index m_methodSpec;
+
+    // generic context of the method that took the address, only set when the instantiation is open (VAR/MVAR)
+    CLR_RT_TypeSpec_Index m_producerGenericType;
+    CLR_RT_MethodSpec_Index m_producerMethodSpec;
+};
+
+//--//
+
+// call sites already validated by CALLI: (calling assembly, signature index, function pointer value), plus the generic
+// context of the caller when the call site signature depends on it
+// metadata can't change once loaded and the function pointer values are immutable, so a successful validation stays
+// valid until the type system is reinitialized
+#if !defined(NANOCLR_CALLI_VALIDATION_CACHE_SIZE)
+#define NANOCLR_CALLI_VALIDATION_CACHE_SIZE 16
+#endif
+
+struct CLR_RT_CallIValidation
+{
+    const CLR_RT_Assembly *m_assembly;
+    // c_CallIContextDependent is set when the call site signature references the generic parameters of the caller,
+    // the validation is then only valid for the generic context of the caller (m_genericType, m_methodSpec)
+    CLR_UINT32 m_signature;
+    CLR_UINT32 m_functionPointer;
+    CLR_UINT32 m_genericType;
+    CLR_UINT32 m_methodSpec;
+
+    static const CLR_UINT32 c_CallIContextDependent = 0x80000000;
+};
+
 struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
 {
     struct CompatibilityLookup
@@ -2063,6 +2102,98 @@ struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
 
     CLR_RT_MethodDef_Index m_entryPoint;
 
+#if NANOCLR_CALLI_VALIDATION_CACHE_SIZE > 0
+    static_assert(
+        (NANOCLR_CALLI_VALIDATION_CACHE_SIZE & (NANOCLR_CALLI_VALIDATION_CACHE_SIZE - 1)) == 0,
+        "NANOCLR_CALLI_VALIDATION_CACHE_SIZE has to be a power of 2");
+
+    CLR_RT_CallIValidation m_calliValidated[NANOCLR_CALLI_VALIDATION_CACHE_SIZE];
+
+    static CLR_UINT32 CallIValidationSlot(const CLR_RT_Assembly *assm, CLR_UINT32 signature, CLR_UINT32 functionPointer)
+    {
+        CLR_UINT32 hash = functionPointer ^ (signature * 0x9E3779B1u) ^ (CLR_UINT32)((size_t)assm >> 4);
+
+        return (hash ^ (hash >> 16)) & (NANOCLR_CALLI_VALIDATION_CACHE_SIZE - 1);
+    }
+
+    // generic context of the caller: genericType and methodSpec of its CLR_RT_MethodDef_Instance
+    static CLR_UINT32 CallIContextGenericType(const CLR_RT_TypeSpec_Index *callerGenericType)
+    {
+        return callerGenericType != nullptr ? callerGenericType->data : 0;
+    }
+
+    bool IsCallIValidated(
+        const CLR_RT_Assembly *assm,
+        CLR_UINT32 signature,
+        CLR_UINT32 functionPointer,
+        const CLR_RT_TypeSpec_Index *callerGenericType,
+        const CLR_RT_MethodSpec_Index &callerMethodSpec) const
+    {
+        const CLR_RT_CallIValidation &entry = m_calliValidated[CallIValidationSlot(assm, signature, functionPointer)];
+
+        if (entry.m_assembly != assm || entry.m_functionPointer != functionPointer)
+        {
+            return false;
+        }
+
+        if (entry.m_signature == signature)
+        {
+            return true;
+        }
+
+        return entry.m_signature == (signature | CLR_RT_CallIValidation::c_CallIContextDependent) &&
+               entry.m_genericType == CallIContextGenericType(callerGenericType) &&
+               entry.m_methodSpec == callerMethodSpec.data;
+    }
+
+    void SetCallIValidated(
+        const CLR_RT_Assembly *assm,
+        CLR_UINT32 signature,
+        CLR_UINT32 functionPointer,
+        const CLR_RT_TypeSpec_Index *callerGenericType,
+        const CLR_RT_MethodSpec_Index &callerMethodSpec,
+        bool callerContextUsed)
+    {
+        CLR_RT_CallIValidation &entry = m_calliValidated[CallIValidationSlot(assm, signature, functionPointer)];
+
+        entry.m_assembly = assm;
+        entry.m_functionPointer = functionPointer;
+
+        if (callerContextUsed)
+        {
+            entry.m_signature = signature | CLR_RT_CallIValidation::c_CallIContextDependent;
+            entry.m_genericType = CallIContextGenericType(callerGenericType);
+            entry.m_methodSpec = callerMethodSpec.data;
+        }
+        else
+        {
+            entry.m_signature = signature;
+            entry.m_genericType = 0;
+            entry.m_methodSpec = 0;
+        }
+    }
+#else
+    bool IsCallIValidated(
+        const CLR_RT_Assembly *,
+        CLR_UINT32,
+        CLR_UINT32,
+        const CLR_RT_TypeSpec_Index *,
+        const CLR_RT_MethodSpec_Index &) const
+    {
+        return false;
+    }
+
+    void SetCallIValidated(
+        const CLR_RT_Assembly *,
+        CLR_UINT32,
+        CLR_UINT32,
+        const CLR_RT_TypeSpec_Index *,
+        const CLR_RT_MethodSpec_Index &,
+        bool)
+    {
+    }
+#endif
+
     // Global registry for generic static fields
     CLR_RT_GenericStaticFieldRecord *m_genericStaticFields;
     CLR_UINT32 m_genericStaticFieldsCount;
@@ -2072,6 +2203,14 @@ struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
     CLR_RT_GenericCctorExecutionRecord *m_genericCctorRegistry;
     CLR_UINT32 m_genericCctorRegistryCount;
     CLR_UINT32 m_genericCctorRegistryMaxCount;
+
+    // Global registry for the generic instantiations targeted by managed function pointers
+    // (a function pointer to a generic instantiation is c_FunctionPointerGenericFlag | index in the registry)
+    static const CLR_UINT32 c_FunctionPointerGenericFlag = 0x80000000;
+
+    CLR_RT_FunctionPointerRecord *m_functionPointers;
+    CLR_UINT32 m_functionPointersCount;
+    CLR_UINT32 m_functionPointersMaxCount;
 
     //--//
 
@@ -2085,6 +2224,12 @@ struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
 
     HRESULT ResolveAll();
     HRESULT PrepareForExecution();
+
+    HRESULT GetFunctionPointer(
+        const CLR_RT_MethodDef_Instance &method,
+        const CLR_RT_MethodDef_Instance *producer,
+        CLR_UINT32 &value);
+    HRESULT ResolveFunctionPointer(CLR_UINT32 value, CLR_RT_MethodDef_Instance &method);
     HRESULT PrepareForExecutionHelper(const char *szAssembly);
 
     CLR_RT_Assembly *FindAssembly(const char *name, const CLR_RECORD_VERSION *ver, bool fExact);
@@ -2162,6 +2307,13 @@ struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
         bool suffixMatchOnly = false);
 
     static bool MatchSignature(CLR_RT_SignatureParser &parserLeft, CLR_RT_SignatureParser &parserRight);
+    bool MatchCallISignature(
+        CLR_RT_SignatureParser &callSite,
+        const CLR_RT_MethodDef_Instance &caller,
+        CLR_RT_SignatureParser &target,
+        const CLR_RT_MethodDef_Instance &targetMethod,
+        CLR_UINT32 functionPointer,
+        bool &callerContextUsed);
     static bool MatchSignatureDirect(
         CLR_RT_SignatureParser &parserLeft,
         CLR_RT_SignatureParser &parserRight,

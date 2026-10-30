@@ -394,6 +394,118 @@ static bool IsCallerFrame(CLR_RT_StackFrame *stack, CLR_RT_StackFrame *candidate
     return false;
 }
 
+//
+// Managed function pointers (C# 'delegate*<...>', IL 'ldftn'/'ldvirtftn') are represented on the evaluation stack
+// (and in fields, locals and arguments) as an I4. See CLR_RT_TypeSystem::GetFunctionPointer for the encoding.
+//
+static inline HRESULT GetFunctionPointer(
+    const CLR_RT_MethodDef_Instance &method,
+    const CLR_RT_MethodDef_Instance *producer,
+    CLR_UINT32 &value)
+{
+    // non generic method (the most common case): the value is the method index, no need to go through the registry
+    if ((method.genericType == nullptr || !NANOCLR_INDEX_IS_VALID(*method.genericType)) &&
+        !NANOCLR_INDEX_IS_VALID(method.methodSpec))
+    {
+        value = method.data;
+        return S_OK;
+    }
+
+    return g_CLR_RT_TypeSystem.GetFunctionPointer(method, producer, value);
+}
+
+static HRESULT ResolveFunctionPointer(const CLR_RT_HeapBlock &ptr, CLR_RT_MethodDef_Instance &inst)
+{
+    NATIVE_PROFILE_CLR_CORE();
+    NANOCLR_HEADER();
+
+    switch (ptr.DataType())
+    {
+        case DATATYPE_I4:
+        case DATATYPE_U4:
+            break;
+
+        default:
+            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    NANOCLR_SET_AND_LEAVE(g_CLR_RT_TypeSystem.ResolveFunctionPointer(ptr.NumericByRefConst().u4, inst));
+
+    NANOCLR_NOCLEANUP();
+}
+
+//
+// Validates a CALLI call site signature against the target of the managed function pointer.
+// Kept out of line: it only runs once per call site / function pointer pair (see CLR_RT_TypeSystem::IsCallIValidated)
+// 'callerContextUsed' is set if the result depends on the generic context of the caller (call site using VAR/MVAR)
+//
+static NANOCLR_NOINLINE HRESULT ValidateCallISignature(
+    CLR_RT_Assembly *assm,
+    CLR_UINT32 arg,
+    CLR_UINT32 functionPointer,
+    CLR_RT_MethodDef_Instance &calleeInst,
+    const CLR_RT_MethodDef_Instance &caller,
+    bool &callerContextUsed)
+{
+    NATIVE_PROFILE_CLR_CORE();
+    NANOCLR_HEADER();
+
+    callerContextUsed = false;
+
+    CLR_RT_SignatureParser parser{};
+    CLR_UINT32 sigNumArgs;
+    bool sigHasThis;
+
+    if (arg > 0xFFFF || (int)arg >= assm->tablesSize[TBL_Signatures])
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    // the call site signature has to match the target method
+    parser.Initialize_MethodSignature(assm, assm->GetSignature((CLR_SIG)arg));
+
+    if ((parser.Flags & (PIMAGE_CEE_CS_CALLCONV_MASK | PIMAGE_CEE_CS_CALLCONV_GENERIC)) !=
+        PIMAGE_CEE_CS_CALLCONV_DEFAULT)
+    {
+        // only managed function pointers are supported
+        NANOCLR_SET_AND_LEAVE(CLR_E_NOT_SUPPORTED);
+    }
+
+    sigHasThis = (parser.Flags & PIMAGE_CEE_CS_CALLCONV_HASTHIS) != 0;
+    sigNumArgs = parser.Available() - 1 + (sigHasThis ? 1 : 0);
+
+    if (sigNumArgs != calleeInst.target->argumentsCount ||
+        sigHasThis == ((calleeInst.target->flags & CLR_RECORD_METHODDEF::MD_Static) != 0) ||
+        (calleeInst.target->flags & CLR_RECORD_METHODDEF::MD_Abstract) != 0)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    // the function pointer can be forged by user code: parameters and return types have to match too
+    // (VAR/MVAR of the call site are resolved with the generic context of the caller, the ones of the target with
+    // its own generic context)
+    {
+        CLR_RT_SignatureParser callSiteParser{};
+        CLR_RT_SignatureParser targetParser{};
+
+        callSiteParser.Initialize_MethodSignature(assm, assm->GetSignature((CLR_SIG)arg));
+        targetParser.Initialize_MethodSignature(&calleeInst);
+
+        if (!g_CLR_RT_TypeSystem.MatchCallISignature(
+                callSiteParser,
+                caller,
+                targetParser,
+                calleeInst,
+                functionPointer,
+                callerContextUsed))
+        {
+            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+        }
+    }
+
+    NANOCLR_NOCLEANUP();
+}
+
 void CLR_RT_Thread::PopEH_Inner(CLR_RT_StackFrame *stack, CLR_PMETADATA ip)
 {
     NATIVE_PROFILE_CLR_CORE();
@@ -2909,6 +3021,100 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                 }
                 //----------------------------------------------------------------------------------------------------------//
 
+                OPDEF(CEE_CALLI, "calli", VarPop, VarPush, InlineSig, IPrimitive, 1, 0xFF, 0x29, CALL)
+                // Stack: ... <arg0> <arg1> ... <argN> <ftn> -> ...
+                {
+                    // index of the method signature in the signatures table (upper 16 bits are reserved)
+                    FETCH_ARG_UINT32(arg, ip);
+
+                    CLR_RT_MethodDef_Instance calleeInst{};
+                    CLR_RT_HeapBlock *pThis;
+                    CLR_UINT32 ftnValue;
+
+                    ftnValue = evalPos[0].NumericByRefConst().u4;
+
+                    // the validation of a call site / function pointer pair is only done once
+                    if ((evalPos[0].DataType() == DATATYPE_I4 || evalPos[0].DataType() == DATATYPE_U4) &&
+                        g_CLR_RT_TypeSystem
+                            .IsCallIValidated(assm, arg, ftnValue, stack->m_call.genericType, stack->m_call.methodSpec))
+                    {
+                        // already validated: a non generic value is the method index
+                        if (ftnValue & CLR_RT_TypeSystem::c_FunctionPointerGenericFlag)
+                        {
+                            NANOCLR_CHECK_HRESULT(g_CLR_RT_TypeSystem.ResolveFunctionPointer(ftnValue, calleeInst));
+                        }
+                        else
+                        {
+                            CLR_RT_MethodDef_Index ftnIndex;
+                            ftnIndex.data = ftnValue;
+
+                            calleeInst.InitializeFromIndex(ftnIndex);
+                        }
+                    }
+                    else
+                    {
+                        bool callerContextUsed;
+
+                        NANOCLR_CHECK_HRESULT(ResolveFunctionPointer(evalPos[0], calleeInst));
+                        NANOCLR_CHECK_HRESULT(
+                            ValidateCallISignature(assm, arg, ftnValue, calleeInst, stack->m_call, callerContextUsed));
+
+                        g_CLR_RT_TypeSystem.SetCallIValidated(
+                            assm,
+                            arg,
+                            ftnValue,
+                            stack->m_call.genericType,
+                            stack->m_call.methodSpec,
+                            callerContextUsed);
+                    }
+
+                    // same as CALL: static method of a generic type requires its static constructor to have run
+                    if ((calleeInst.target->flags & CLR_RECORD_METHODDEF::MD_Static) && calleeInst.genericType &&
+                        NANOCLR_INDEX_IS_VALID(*calleeInst.genericType))
+                    {
+                        CLR_RT_TypeSpec_Instance tsInst;
+                        if (tsInst.InitializeFromIndex(*calleeInst.genericType))
+                        {
+                            hr = EnsureGenericCctorCompleted(tsInst, stack, th);
+                            if (hr == CLR_E_PROCESS_EXCEPTION)
+                            {
+                                // re-execute calli (opcode + 4 bytes signature) once the static constructor completes
+                                ip -= 5;
+                                WRITEBACK(stack, evalPos, ip, fDirty);
+                                goto Execute_Restart;
+                            }
+                            else if (hr == CLR_E_RESCHEDULE)
+                            {
+                                ip -= 5;
+                                NANOCLR_SET_AND_LEAVE(CLR_E_RESCHEDULE);
+                            }
+                            NANOCLR_CHECK_HRESULT(hr);
+                        }
+                    }
+
+                    // pop the function pointer
+                    evalPos--;
+
+                    pThis = &evalPos[1 - calleeInst.target->argumentsCount]; // Point to the first arg, 'this' if an
+                                                                             // instance method
+#ifndef NANOCLR_NO_IL_INLINE
+                    if (stack->PushInline(ip, assm, evalPos, calleeInst, pThis))
+                    {
+                        fDirty = true;
+                        break;
+                    }
+#else
+                (void)pThis;
+#endif
+
+                    WRITEBACK(stack, evalPos, ip, fDirty);
+                    NANOCLR_CHECK_HRESULT(CLR_RT_StackFrame::Push(th, calleeInst, -1));
+
+                    goto Execute_Restart;
+                }
+
+                //----------------------------------------------------------------------------------------------------------//
+
                 OPDEF(CEE_RET, "ret", VarPop, Push0, InlineNone, IPrimitive, 1, 0xFF, 0x2A, RETURN)
                 {
 #ifndef NANOCLR_NO_IL_INLINE
@@ -3276,8 +3482,8 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     if (cls.target->IsDelegate())
                     {
                         //
-                        // Special case for delegates. LDFTN or LDVIRTFTN have already created the delegate object, just
-                        // check that...
+                        // Special case for delegates. LDFTN or LDVIRTFTN have pushed the target method (as a function
+                        // pointer), create the delegate object here...
                         //
                         changes = -calleeInst.target->argumentsCount;
                         NANOCLR_CHECK_HRESULT(CLR_Checks::VerifyStackOK(
@@ -3287,6 +3493,15 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                         stack->m_evalStackPos += changes;
 
                         top = stack->m_evalStackPos++; // Push back the result.
+
+                        if (top[1].DataType() == DATATYPE_I4 || top[1].DataType() == DATATYPE_U4)
+                        {
+                            CLR_RT_MethodDef_Instance ftnInst{};
+
+                            NANOCLR_CHECK_HRESULT(ResolveFunctionPointer(top[1], ftnInst));
+
+                            NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(top[1], ftnInst, stack));
+                        }
 
                         if (top[1].DataType() != DATATYPE_OBJECT)
                         {
@@ -4861,14 +5076,17 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     CHECKSTACK(stack, evalPos);
 
                     CLR_RT_MethodDef_Instance method{};
-                    if (method.ResolveToken(arg, assm, stack->m_call.genericType) == false)
+                    if (method.ResolveToken(arg, assm, stack->m_call.genericType, &stack->m_call) == false)
                     {
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     }
 
-                    UPDATESTACK(stack, evalPos);
+                    // push a managed function pointer (no heap allocation)
+                    // when used to create a delegate, NEWOBJ takes care of allocating the delegate object
+                    CLR_UINT32 ftn;
+                    NANOCLR_CHECK_HRESULT(GetFunctionPointer(method, &stack->m_call, ftn));
 
-                    NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(evalPos[0], method, stack));
+                    evalPos[0].SetInteger((CLR_INT32)ftn);
                     break;
                 }
 
@@ -4879,7 +5097,7 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     FETCH_ARG_COMPRESSED_METHODTOKEN(arg, ip);
 
                     CLR_RT_MethodDef_Instance callee{};
-                    if (callee.ResolveToken(arg, assm, stack->m_call.genericType) == false)
+                    if (callee.ResolveToken(arg, assm, stack->m_call.genericType, &stack->m_call) == false)
                     {
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     }
@@ -4895,9 +5113,53 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     }
 
-                    UPDATESTACK(stack, evalPos);
+                    // keep the generic context of the resolved method (same as CALLVIRT does)
+                    CLR_RT_MethodDef_Instance calleeRealInst{};
+                    const CLR_RT_TypeSpec_Index *calleeRealGenericType = nullptr;
+                    CLR_RT_HeapBlock *obj = evalPos[0].Dereference();
 
-                    NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(evalPos[0], calleeReal, stack));
+                    if (obj != nullptr && obj->IsAGenericInstance() && NANOCLR_INDEX_IS_VALID(obj->ObjectGenericType()))
+                    {
+                        // the object closed generic type is the context of the method that is going to be called
+                        calleeRealGenericType = &obj->ObjectGenericType();
+                    }
+                    else if (callee.genericType != nullptr && NANOCLR_INDEX_IS_VALID(*callee.genericType))
+                    {
+                        calleeRealGenericType = callee.genericType;
+                    }
+
+                    if (calleeRealGenericType != nullptr)
+                    {
+                        if (calleeRealInst.InitializeFromIndex(calleeReal, *calleeRealGenericType, &stack->m_call) ==
+                            false)
+                        {
+                            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                        }
+
+                        // context doesn't belong to the method declaring type: drop it (same as CALLVIRT)
+                        CLR_RT_TypeSpec_Instance tsCheck{};
+                        CLR_RT_TypeDef_Instance declCheck{};
+                        if (!tsCheck.InitializeFromIndex(*calleeRealGenericType) ||
+                            !declCheck.InitializeFromMethod(calleeRealInst) ||
+                            tsCheck.genericTypeDef.data != declCheck.data)
+                        {
+                            calleeRealInst.genericType = nullptr;
+                        }
+                    }
+                    else if (calleeRealInst.InitializeFromIndex(calleeReal) == false)
+                    {
+                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+                    }
+
+                    // generic virtual method instantiation
+                    calleeRealInst.methodSpec = callee.methodSpec;
+
+                    // push a managed function pointer (no heap allocation)
+                    // when used to create a delegate, NEWOBJ takes care of allocating the delegate object
+                    CLR_UINT32 ftn;
+                    NANOCLR_CHECK_HRESULT(GetFunctionPointer(calleeRealInst, &stack->m_call, ftn));
+
+                    evalPos[0].SetInteger((CLR_INT32)ftn);
                     break;
                 }
 
@@ -4947,14 +5209,28 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     FETCH_ARG_COMPRESSED_TYPETOKEN(arg, ip);
 
                     CLR_RT_TypeDef_Instance clsInst{};
-                    if (clsInst.ResolveToken(arg, assm, &stack->m_call) == false)
+                    CLR_INT32 len;
+
+                    // a type specification of a single primitive type (managed function pointer stored as I4)
+                    CLR_PMETADATA typeSpecSig = nullptr;
+
+                    if (CLR_TypeFromTk(arg) == TBL_TypeSpec)
+                    {
+                        typeSpecSig = assm->GetSignature(assm->GetTypeSpec(CLR_DataFromTk(arg))->signature);
+                    }
+
+                    if (typeSpecSig != nullptr && typeSpecSig[0] < DATATYPE_FIRST_INVALID &&
+                        (c_CLR_RT_DataTypeLookup[typeSpecSig[0]].m_flags & CLR_RT_DataTypeLookup::c_Primitive) &&
+                        c_CLR_RT_DataTypeLookup[typeSpecSig[0]].m_sizeInBytes != CLR_RT_DataTypeLookup::c_NA &&
+                        c_CLR_RT_DataTypeLookup[typeSpecSig[0]].m_sizeInBytes != CLR_RT_DataTypeLookup::c_VariableSize)
+                    {
+                        len = c_CLR_RT_DataTypeLookup[typeSpecSig[0]].m_sizeInBytes;
+                    }
+                    else if (clsInst.ResolveToken(arg, assm, &stack->m_call) == false)
                     {
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     }
-
-                    CLR_INT32 len;
-
-                    if (clsInst.target->dataType)
+                    else if (clsInst.target->dataType)
                     {
                         len = sizeof(struct CLR_RT_HeapBlock);
                     }
@@ -5096,7 +5372,6 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                 OPDEF(CEE_ARGLIST, "arglist", Pop0, PushI, InlineNone, IPrimitive, 2, 0xFE, 0x00, NEXT)
                 OPDEF(CEE_JMP, "jmp", Pop0, Push0, InlineMethod, IPrimitive, 1, 0xFF, 0x27, CALL)
                 OPDEF(CEE_INITBLK, "initblk", PopI + PopI + PopI, Push0, InlineNone, IPrimitive, 2, 0xFE, 0x18, NEXT)
-                OPDEF(CEE_CALLI, "calli", VarPop, VarPush, InlineSig, IPrimitive, 1, 0xFF, 0x29, CALL)
                 OPDEF(CEE_CKFINITE, "ckfinite", Pop1, PushR8, InlineNone, IPrimitive, 1, 0xFF, 0xC3, NEXT)
                 OPDEF(CEE_MKREFANY, "mkrefany", PopI, Push1, InlineType, IPrimitive, 1, 0xFF, 0xC6, NEXT)
                 OPDEF(CEE_REFANYTYPE, "refanytype", Pop1, PushI, InlineNone, IPrimitive, 2, 0xFE, 0x1D, NEXT)
