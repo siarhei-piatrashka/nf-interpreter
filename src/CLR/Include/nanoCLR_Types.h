@@ -435,6 +435,9 @@ enum CLR_DataType // KEEP IN SYNC WITH nanoCLR_DataType enum in nanoFramework.To
 
     DATATYPE_TYPE_MODIFIER = 0x40,
     DATATYPE_TYPE_SENTINEL = 0x01 | DATATYPE_TYPE_MODIFIER, // sentinel for varargs
+    DATATYPE_TYPE_FNPTR = 0x02 | DATATYPE_TYPE_MODIFIER, // managed function pointer in a method signature: followed by
+                                                         // the (16 bits, little endian) index of the function pointer
+                                                         // signature and by the DATATYPE_I4 storage type
     DATATYPE_TYPE_PINNED = 0x05 | DATATYPE_TYPE_MODIFIER,
     DATATYPE_TYPE_R4_HFA = 0x06 | DATATYPE_TYPE_MODIFIER, // used only internally for R4 HFA types
     DATATYPE_TYPE_R8_HFA = 0x07 | DATATYPE_TYPE_MODIFIER, // used only internally for R8 HFA types

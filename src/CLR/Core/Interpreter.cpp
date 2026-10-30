@@ -392,6 +392,212 @@ static bool IsCallerFrame(CLR_RT_StackFrame *stack, CLR_RT_StackFrame *candidate
     return false;
 }
 
+//
+// Managed function pointers (C# 'delegate*<...>', IL 'ldftn'/'ldvirtftn') are represented on the evaluation stack
+// (and in fields, locals and arguments) as an I4 holding the CLR_RT_MethodDef_Index of the target method.
+// Because that value can be forged by user code, it's fully validated before being used.
+//
+static HRESULT ResolveFunctionPointer(const CLR_RT_HeapBlock &ptr, CLR_RT_MethodDef_Instance &inst)
+{
+    NATIVE_PROFILE_CLR_CORE();
+    NANOCLR_HEADER();
+
+    CLR_RT_MethodDef_Index idx;
+    CLR_RT_Assembly *targetAssm;
+    CLR_UINT32 assmIdx;
+
+    switch (ptr.DataType())
+    {
+        case DATATYPE_I4:
+        case DATATYPE_U4:
+            break;
+
+        default:
+            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    idx.m_data = ptr.NumericByRefConst().u4;
+
+    if (idx.m_data == 0)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_NULL_REFERENCE);
+    }
+
+    assmIdx = idx.Assembly();
+
+    if (assmIdx == 0 || assmIdx > g_CLR_RT_TypeSystem.m_assembliesMax)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    targetAssm = g_CLR_RT_TypeSystem.m_assemblies[assmIdx - 1];
+
+    if (targetAssm == NULL || idx.Method() >= targetAssm->m_pTablesSize[TBL_MethodDef])
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    if (inst.InitializeFromIndex(idx) == false)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    NANOCLR_NOCLEANUP();
+}
+
+//
+// A type of a CALLI call site and the corresponding type of the target are compatible if they are identical or, for
+// types passed by value, if there is an implicit reference conversion between them (as for the C# conversions of
+// method groups and function pointers: parameters are contravariant, the return type is covariant).
+//
+static bool FunctionPointer_IsReferenceElement(const CLR_RT_SignatureParser::Element &res)
+{
+    CLR_RT_TypeDef_Instance inst{};
+
+    switch (res.m_dt)
+    {
+        case DATATYPE_CLASS:
+        case DATATYPE_STRING:
+        case DATATYPE_OBJECT:
+            break;
+
+        default:
+            return false;
+    }
+
+    if (res.m_fnPtrSig != nullptr || !inst.InitializeFromIndex(res.m_cls))
+    {
+        return false;
+    }
+
+    switch (inst.m_target->flags & CLR_RECORD_TYPEDEF::TD_Semantics_Mask)
+    {
+        case CLR_RECORD_TYPEDEF::TD_Semantics_Class:
+        case CLR_RECORD_TYPEDEF::TD_Semantics_Interface:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool FunctionPointer_IsReferenceConversion(
+    const CLR_RT_SignatureParser::Element &from,
+    const CLR_RT_SignatureParser::Element &to)
+{
+    if (from.m_fByRef || to.m_fByRef || from.m_fnPtrSig != nullptr || to.m_fnPtrSig != nullptr ||
+        to.m_levels > from.m_levels)
+    {
+        return false;
+    }
+
+    if (from.m_levels > to.m_levels)
+    {
+        // an array (element of the array) to System.Object, System.Array or one of its interfaces
+        return to.m_cls.m_data == g_CLR_RT_WellKnownTypes.m_Object.m_data ||
+               CLR_RT_ExecutionEngine::IsInstanceOf(g_CLR_RT_WellKnownTypes.m_Array, to.m_cls);
+    }
+
+    // same rank: reference types only (arrays are covariant for reference element types)
+    if (!FunctionPointer_IsReferenceElement(from) || !FunctionPointer_IsReferenceElement(to))
+    {
+        return false;
+    }
+
+    return to.m_cls.m_data == g_CLR_RT_WellKnownTypes.m_Object.m_data ||
+           CLR_RT_ExecutionEngine::IsInstanceOf(from.m_cls, to.m_cls);
+}
+
+static bool FunctionPointer_MatchCallISignature(CLR_RT_SignatureParser &callSite, CLR_RT_SignatureParser &target)
+{
+    if (callSite.m_type != target.m_type || callSite.m_flags != target.m_flags ||
+        callSite.Available() != target.Available())
+    {
+        return false;
+    }
+
+    // the return type comes first
+    for (bool isReturn = true; callSite.Available() > 0; isReturn = false)
+    {
+        CLR_RT_SignatureParser::Element resCallSite;
+        CLR_RT_SignatureParser::Element resTarget;
+
+        if (FAILED(callSite.Advance(resCallSite)) || FAILED(target.Advance(resTarget)))
+        {
+            return false;
+        }
+
+        if (CLR_RT_TypeSystem::MatchSignatureElement(resCallSite, resTarget, false))
+        {
+            continue;
+        }
+
+        if (isReturn ? !FunctionPointer_IsReferenceConversion(resTarget, resCallSite)
+                     : !FunctionPointer_IsReferenceConversion(resCallSite, resTarget))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+//
+// Validates a CALLI call site signature against the target of the managed function pointer.
+// Kept out of line: it only runs once per call site / function pointer pair (see CLR_RT_TypeSystem::IsCallIValidated)
+//
+static NANOCLR_NOINLINE HRESULT
+    ValidateCallISignature(CLR_RT_Assembly *assm, CLR_UINT32 arg, const CLR_RT_MethodDef_Instance &calleeInst)
+{
+    NATIVE_PROFILE_CLR_CORE();
+    NANOCLR_HEADER();
+
+    CLR_RT_SignatureParser parser{};
+    CLR_UINT32 sigNumArgs;
+    bool sigHasThis;
+
+    if (arg > 0xFFFF || (int)arg >= assm->m_pTablesSize[TBL_Signatures])
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    // the call site signature has to match the target method
+    parser.Initialize_MethodSignature(assm, assm->GetSignature((CLR_SIG)arg));
+
+    if ((parser.m_flags & (PIMAGE_CEE_CS_CALLCONV_MASK | PIMAGE_CEE_CS_CALLCONV_GENERIC)) !=
+        PIMAGE_CEE_CS_CALLCONV_DEFAULT)
+    {
+        // only managed function pointers are supported
+        NANOCLR_SET_AND_LEAVE(CLR_E_NOT_SUPPORTED);
+    }
+
+    sigHasThis = (parser.m_flags & PIMAGE_CEE_CS_CALLCONV_HASTHIS) != 0;
+    sigNumArgs = parser.Available() - 1 + (sigHasThis ? 1 : 0);
+
+    if (sigNumArgs != calleeInst.m_target->numArgs ||
+        sigHasThis == ((calleeInst.m_target->flags & CLR_RECORD_METHODDEF::MD_Static) != 0) ||
+        (calleeInst.m_target->flags & CLR_RECORD_METHODDEF::MD_Abstract) != 0)
+    {
+        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+    }
+
+    // the function pointer can be forged by user code: parameters and return types have to be compatible too
+    {
+        CLR_RT_SignatureParser callSiteParser{};
+        CLR_RT_SignatureParser targetParser{};
+
+        callSiteParser.Initialize_MethodSignature(assm, assm->GetSignature((CLR_SIG)arg));
+        targetParser.Initialize_MethodSignature(calleeInst.m_assm, calleeInst.m_target);
+
+        if (!FunctionPointer_MatchCallISignature(callSiteParser, targetParser))
+        {
+            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+        }
+    }
+
+    NANOCLR_NOCLEANUP();
+}
+
 void CLR_RT_Thread::PopEH_Inner(CLR_RT_StackFrame *stack, CLR_PMETADATA ip)
 {
     NATIVE_PROFILE_CLR_CORE();
@@ -2229,6 +2435,59 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                 }
                 //----------------------------------------------------------------------------------------------------------//
 
+                OPDEF(CEE_CALLI, "calli", VarPop, VarPush, InlineSig, IPrimitive, 1, 0xFF, 0x29, CALL)
+                // Stack: ... <arg0> <arg1> ... <argN> <ftn> -> ...
+                {
+                    // index of the method signature in the signatures table (upper 16 bits are reserved)
+                    FETCH_ARG_UINT32(arg, ip);
+
+                    CLR_RT_MethodDef_Instance calleeInst{};
+                    CLR_RT_HeapBlock *pThis;
+                    CLR_UINT32 ftnValue;
+
+                    ftnValue = evalPos[0].NumericByRefConst().u4;
+
+                    // the validation of a call site / function pointer pair is only done once
+                    if ((evalPos[0].DataType() == DATATYPE_I4 || evalPos[0].DataType() == DATATYPE_U4) &&
+                        g_CLR_RT_TypeSystem.IsCallIValidated(assm, arg, ftnValue))
+                    {
+                        // already validated: the value is the method index
+                        CLR_RT_MethodDef_Index ftnIndex;
+                        ftnIndex.m_data = ftnValue;
+
+                        calleeInst.InitializeFromIndex(ftnIndex);
+                    }
+                    else
+                    {
+                        NANOCLR_CHECK_HRESULT(ResolveFunctionPointer(evalPos[0], calleeInst));
+                        NANOCLR_CHECK_HRESULT(ValidateCallISignature(assm, arg, calleeInst));
+
+                        g_CLR_RT_TypeSystem.SetCallIValidated(assm, arg, ftnValue);
+                    }
+
+                    // pop the function pointer
+                    evalPos--;
+
+                    pThis = &evalPos[1 - calleeInst.m_target->numArgs]; // Point to the first arg, 'this' if an
+                                                                        // instance method
+#ifndef NANOCLR_NO_IL_INLINE
+                    if (stack->PushInline(ip, assm, evalPos, calleeInst, pThis))
+                    {
+                        fDirty = true;
+                        break;
+                    }
+#else
+                (void)pThis;
+#endif
+
+                    WRITEBACK(stack, evalPos, ip, fDirty);
+                    NANOCLR_CHECK_HRESULT(CLR_RT_StackFrame::Push(th, calleeInst, -1));
+
+                    goto Execute_Restart;
+                }
+
+                //----------------------------------------------------------------------------------------------------------//
+
                 OPDEF(CEE_RET, "ret", VarPop, Push0, InlineNone, IPrimitive, 1, 0xFF, 0x2A, RETURN)
                 {
 #ifndef NANOCLR_NO_IL_INLINE
@@ -2363,8 +2622,8 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     if (cls.m_target->IsDelegate())
                     {
                         //
-                        // Special case for delegates. LDFTN or LDVIRTFTN have already created the delegate object, just
-                        // check that...
+                        // Special case for delegates. LDFTN or LDVIRTFTN have pushed the target method (as a function
+                        // pointer), create the delegate object here...
                         //
                         changes = -calleeInst.m_target->numArgs;
                         NANOCLR_CHECK_HRESULT(CLR_Checks::VerifyStackOK(
@@ -2374,6 +2633,15 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                         stack->m_evalStackPos += changes;
 
                         top = stack->m_evalStackPos++; // Push back the result.
+
+                        if (top[1].DataType() == DATATYPE_I4 || top[1].DataType() == DATATYPE_U4)
+                        {
+                            CLR_RT_MethodDef_Instance ftnInst{};
+
+                            NANOCLR_CHECK_HRESULT(ResolveFunctionPointer(top[1], ftnInst));
+
+                            NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(top[1], ftnInst, stack));
+                        }
 
                         if (top[1].DataType() != DATATYPE_OBJECT)
                         {
@@ -3299,9 +3567,9 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     if (method.ResolveToken(arg, assm) == false)
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
 
-                    UPDATESTACK(stack, evalPos);
-
-                    NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(evalPos[0], method, stack));
+                    // push a managed function pointer (no heap allocation)
+                    // when used to create a delegate, NEWOBJ takes care of allocating the delegate object
+                    evalPos[0].SetInteger((CLR_INT32)method.m_data);
                     break;
                 }
 
@@ -3325,9 +3593,9 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     }
 
-                    UPDATESTACK(stack, evalPos);
-
-                    NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_Delegate::CreateInstance(evalPos[0], calleeReal, stack));
+                    // push a managed function pointer (no heap allocation)
+                    // when used to create a delegate, NEWOBJ takes care of allocating the delegate object
+                    evalPos[0].SetInteger((CLR_INT32)calleeReal.m_data);
                     break;
                 }
 
@@ -3377,11 +3645,28 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     FETCH_ARG_COMPRESSED_TYPETOKEN(arg, ip);
 
                     CLR_RT_TypeDef_Instance clsInst{};
-                    if (clsInst.ResolveToken(arg, assm) == false)
-                        NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
                     CLR_INT32 len;
 
-                    if (clsInst.m_target->dataType)
+                    if (clsInst.ResolveToken(arg, assm) == false)
+                    {
+                        // a type specification of a primitive type (managed function pointer stored as I4)
+                        if (CLR_TypeFromTk(arg) != TBL_TypeSpec)
+                            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+
+                        CLR_RT_SignatureParser parser{};
+                        CLR_RT_SignatureParser::Element res;
+
+                        parser.Initialize_TypeSpec(assm, assm->GetTypeSpec(CLR_DataFromTk(arg)));
+
+                        if (FAILED(parser.Advance(res)) || res.m_fByRef || res.m_levels ||
+                            res.m_dt >= DATATYPE_FIRST_INVALID ||
+                            c_CLR_RT_DataTypeLookup[res.m_dt].m_sizeInBytes == 0 ||
+                            c_CLR_RT_DataTypeLookup[res.m_dt].m_sizeInBytes == CLR_RT_DataTypeLookup::c_VariableSize)
+                            NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
+
+                        len = c_CLR_RT_DataTypeLookup[res.m_dt].m_sizeInBytes;
+                    }
+                    else if (clsInst.m_target->dataType)
                     {
                         len = sizeof(struct CLR_RT_HeapBlock);
                     }
@@ -3442,7 +3727,6 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                 OPDEF(CEE_CPBLK, "cpblk", PopI + PopI + PopI, Push0, InlineNone, IPrimitive, 2, 0xFE, 0x17, NEXT)
                 OPDEF(CEE_JMP, "jmp", Pop0, Push0, InlineMethod, IPrimitive, 1, 0xFF, 0x27, CALL)
                 OPDEF(CEE_INITBLK, "initblk", PopI + PopI + PopI, Push0, InlineNone, IPrimitive, 2, 0xFE, 0x18, NEXT)
-                OPDEF(CEE_CALLI, "calli", VarPop, VarPush, InlineSig, IPrimitive, 1, 0xFF, 0x29, CALL)
                 OPDEF(CEE_CKFINITE, "ckfinite", Pop1, PushR8, InlineNone, IPrimitive, 1, 0xFF, 0xC3, NEXT)
                 OPDEF(CEE_LOCALLOC, "localloc", PopI, PushI, InlineNone, IPrimitive, 2, 0xFE, 0x0F, NEXT)
                 OPDEF(CEE_MKREFANY, "mkrefany", PopI, Push1, InlineType, IPrimitive, 1, 0xFF, 0xC6, NEXT)

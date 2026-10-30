@@ -325,6 +325,8 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
 
     res.m_fByRef = false;
     res.m_levels = 0;
+    res.m_fnPtrAssm = nullptr;
+    res.m_fnPtrSig = nullptr;
 
     switch (m_type)
     {
@@ -414,6 +416,17 @@ HRESULT CLR_RT_SignatureParser::Advance(Element &res)
                     case DATATYPE_SZARRAY:
                         res.m_levels++;
                         break;
+
+                    case DATATYPE_TYPE_FNPTR:
+                    {
+                        // managed function pointer: keep its signature, the storage type follows
+                        CLR_SIG fnPtrSig = (CLR_SIG)(m_sig[0] | (m_sig[1] << 8));
+                        m_sig += 2;
+
+                        res.m_fnPtrAssm = m_assm;
+                        res.m_fnPtrSig = m_assm->GetSignature(fnPtrSig);
+                    }
+                    break;
 
                     case DATATYPE_CLASS:
                     case DATATYPE_VALUETYPE:
@@ -3447,6 +3460,10 @@ void CLR_RT_TypeSystem::TypeSystem_Cleanup()
     NANOCLR_FOREACH_ASSEMBLY_END();
 
     m_assembliesMax = 0;
+
+#if NANOCLR_CALLI_VALIDATION_CACHE_SIZE > 0
+    memset(m_calliValidated, 0, sizeof(m_calliValidated));
+#endif
 }
 
 //--//
@@ -4237,6 +4254,22 @@ bool CLR_RT_TypeSystem::MatchSignatureElement(
             return false;
         if (resLeft.m_cls.m_data != resRight.m_cls.m_data)
             return false;
+
+        // managed function pointers are stored as I4, so their signatures have to match too
+        if ((resLeft.m_fnPtrSig == nullptr) != (resRight.m_fnPtrSig == nullptr))
+            return false;
+
+        if (resLeft.m_fnPtrSig != nullptr && resLeft.m_fnPtrSig != resRight.m_fnPtrSig)
+        {
+            CLR_RT_SignatureParser parserLeft{};
+            CLR_RT_SignatureParser parserRight{};
+
+            parserLeft.Initialize_MethodSignature(resLeft.m_fnPtrAssm, resLeft.m_fnPtrSig);
+            parserRight.Initialize_MethodSignature(resRight.m_fnPtrAssm, resRight.m_fnPtrSig);
+
+            if (!MatchSignature(parserLeft, parserRight))
+                return false;
+        }
     }
 
     return true;

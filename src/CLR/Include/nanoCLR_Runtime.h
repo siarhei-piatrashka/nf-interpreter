@@ -1036,6 +1036,10 @@ struct CLR_RT_SignatureParser
         int m_levels;
         CLR_DataType m_dt;
         CLR_RT_TypeDef_Index m_cls;
+
+        // signature of a managed function pointer (only available in method signatures)
+        CLR_RT_Assembly *m_fnPtrAssm;
+        CLR_PMETADATA m_fnPtrSig;
     };
 
     CLR_RT_HeapBlock *m_lst;
@@ -1767,6 +1771,20 @@ extern const CLR_RT_LogicalOpcodeLookup c_CLR_RT_LogicalOpcodeLookup[];
 
 //--//
 
+// call sites already validated by CALLI: (calling assembly, signature index, function pointer value)
+// metadata can't change once loaded and the function pointer values are immutable, so a successful validation stays
+// valid until the type system is reinitialized
+#if !defined(NANOCLR_CALLI_VALIDATION_CACHE_SIZE)
+#define NANOCLR_CALLI_VALIDATION_CACHE_SIZE 16
+#endif
+
+struct CLR_RT_CallIValidation
+{
+    const CLR_RT_Assembly *m_assembly;
+    CLR_UINT32 m_signature;
+    CLR_UINT32 m_functionPointer;
+};
+
 struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
 {
     struct CompatibilityLookup
@@ -1792,6 +1810,46 @@ struct CLR_RT_TypeSystem // EVENT HEAP - NO RELOCATION -
     CLR_RT_Assembly *m_assemblyNative;
 
     CLR_RT_MethodDef_Index m_entryPoint;
+
+#if NANOCLR_CALLI_VALIDATION_CACHE_SIZE > 0
+    static_assert(
+        (NANOCLR_CALLI_VALIDATION_CACHE_SIZE & (NANOCLR_CALLI_VALIDATION_CACHE_SIZE - 1)) == 0,
+        "NANOCLR_CALLI_VALIDATION_CACHE_SIZE has to be a power of 2");
+
+    CLR_RT_CallIValidation m_calliValidated[NANOCLR_CALLI_VALIDATION_CACHE_SIZE];
+
+    static CLR_UINT32 CallIValidationSlot(const CLR_RT_Assembly *assm, CLR_UINT32 signature, CLR_UINT32 functionPointer)
+    {
+        CLR_UINT32 hash = functionPointer ^ (signature * 0x9E3779B1u) ^ (CLR_UINT32)((size_t)assm >> 4);
+
+        return (hash ^ (hash >> 16)) & (NANOCLR_CALLI_VALIDATION_CACHE_SIZE - 1);
+    }
+
+    bool IsCallIValidated(const CLR_RT_Assembly *assm, CLR_UINT32 signature, CLR_UINT32 functionPointer) const
+    {
+        const CLR_RT_CallIValidation &entry = m_calliValidated[CallIValidationSlot(assm, signature, functionPointer)];
+
+        return entry.m_assembly == assm && entry.m_signature == signature && entry.m_functionPointer == functionPointer;
+    }
+
+    void SetCallIValidated(const CLR_RT_Assembly *assm, CLR_UINT32 signature, CLR_UINT32 functionPointer)
+    {
+        CLR_RT_CallIValidation &entry = m_calliValidated[CallIValidationSlot(assm, signature, functionPointer)];
+
+        entry.m_assembly = assm;
+        entry.m_signature = signature;
+        entry.m_functionPointer = functionPointer;
+    }
+#else
+    bool IsCallIValidated(const CLR_RT_Assembly *, CLR_UINT32, CLR_UINT32) const
+    {
+        return false;
+    }
+
+    void SetCallIValidated(const CLR_RT_Assembly *, CLR_UINT32, CLR_UINT32)
+    {
+    }
+#endif
 
     //--//
 

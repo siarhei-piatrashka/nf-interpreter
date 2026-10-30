@@ -604,6 +604,11 @@ void CLR_RT_Assembly::DumpSignature(const CLR_UINT8 *&p)
             CLR_Debug::Printf("SZARRAY ");
             DumpSignature(p);
             break;
+        case DATATYPE_TYPE_FNPTR:
+            CLR_Debug::Printf("FNPTR(sig %04x) ", (CLR_UINT32)(p[0] | (p[1] << 8)));
+            p += 2;
+            DumpSignature(p);
+            break;
 
         default:
             CLR_Debug::Printf("[UNKNOWN: %08x]", opt);
@@ -663,7 +668,17 @@ void CLR_RT_Assembly::DumpOpcodeDirect(
 
     if (IsOpParamToken(opParam))
     {
-        DumpToken(CLR_ReadTokenCompressed(ip, op));
+        CLR_UINT32 token = CLR_ReadTokenCompressed(ip, op);
+
+        if (op == CEE_CALLI)
+        {
+            // calli operand is a signature index, not a metadata token
+            CLR_Debug::Printf("sig %04x", token);
+        }
+        else
+        {
+            DumpToken(token);
+        }
     }
     else
     {
