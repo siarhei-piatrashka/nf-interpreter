@@ -30,7 +30,7 @@ unsafe
 What is supported:
 
 - **Targets:** static methods, plus generic methods and methods of generic types (closed, or open over the caller's `T`; develop only).
-- **Signatures:** any arity, and any parameter or return type: primitives, structs, generic structs, classes, arrays, `ref`/`out`/`in`, `ref` returns, `void`, nested function pointers.
+- **Signatures:** no delegate-style arity restriction, within the existing PE evaluation-stack limit (§4), and parameter or return types including primitives, structs, generic structs, classes, arrays, `ref`/`out`/`in`, `ref` returns, `void`, nested function pointers.
 - **Where they can live:** locals, fields (static and instance), arrays, parameters, and return values. They can be compared (`==`, `!=`), passed around, converted to delegates, and measured with `sizeof`.
 - **Calls:** `calli` dispatch to the exact target method.
 
@@ -230,6 +230,7 @@ A pointer to a generic instantiation needs a generic context (a TypeSpec for `G<
 | Conversion to and from `IntPtr`/`void*` | Allowed and meaningful (interop) | Casts compile, but the value is a token, not an address. Do not pass it to native code. Locals of pointer type (`void* p = f;`) are rejected by the MDP, as for any pointer type in nanoFramework. Cast inline instead: `(delegate*<int,int>)(void*)f`. |
 | Unmanaged pointers (`delegate* unmanaged`) | Supported | Not supported; build error from MDP |
 | Generic targets | Supported | Develop (2.x) only. On 1.x, generic code is not supported in general. A `calli` whose call site or target depends on a generic method that was called with another method's type parameter (`A<T>() => B<T>()`, the MethodSpec `B<!!0>` stays open at run time) is rejected with `CLR_E_WRONG_TYPE`. The develop runtime cannot resolve such contexts in general: `v.ToString()` on `U` inside `B<U>` already asserts upstream. Generic *type* parameters (`G<T>.M() => Apply<T>(...)`) are fully supported. |
+| Arity and evaluation stack | 254- and 255-parameter calls both execute successfully | The unchanged PE format has a one-byte evaluation-stack size, at most 255 slots. A static `calli` needs its arguments plus one pointer slot: at most 254 arguments when nothing else is on the stack. A retained value or an implicit `this` consumes another slot. MDP rejects methods containing `calli` whose calculated maximum stack exceeds 255, rather than silently truncating the size. Raising this limit requires a PE-format change and is outside this zero-breaking-change implementation. |
 | `in` / `ref readonly` parameters | Supported | Supported (encoded as `ref`). Needs `IsReadOnlyAttribute`/`InAttribute` in corlib, which CoreLibrary 2.x provides. |
 | Custom modifiers in signatures | Part of the signature identity | Stripped. Two overloads that differ only by modifiers would collide, as for normal methods in nanoFramework. |
 | `calli` signature check | None: a mismatched forged pointer is undefined behaviour or a crash | Validated on first use per (site, target). Conversions C# allows are accepted, including reference-type variance, except reference conversions to generic types (next row). A forged pointer with an incompatible signature throws `System.Exception` (`CLR_E_WRONG_TYPE`) instead of corrupting memory. A forged pointer that relies on a conversion C# rejects but CoreCLR happens to execute (e.g. `object` → `string` parameter) also throws. |
@@ -332,18 +333,22 @@ Develop's larger code size comes from three things: generic-instantiation identi
 
 | Where | 1.x | develop |
 |---|---:|---:|
-| MDP unit tests (`FunctionPointersTests.cs`) | 22 | 22 |
-| CoreLibrary `NFUnitTestFunctionPointers` (on device or nanoCLR) | 35 | 51 (incl. `UnitTestGenericFunctionPointersTests.cs`) |
+| MDP unit tests (`FunctionPointersTests.cs`) | 28 | 28 |
+| CoreLibrary `NFUnitTestFunctionPointers` (on device or nanoCLR) | 39 | 57 (incl. `UnitTestGenericFunctionPointersTests.cs`) |
 | CoreLibrary `NFUnitTestDelegates` (regression) | 46 | 46 |
 | End-to-end harness (debug and stress-GC runtime) | 77 | 110 |
 | Adversarial audit (forged pointers, mismatched signatures, cache poisoning, overload collisions) | 35 | 55 |
 | Edge cases (40 mixed-type parameters, 20 struct parameters with a struct return, equality including generic instantiations, `void*` round-trip, recursion, a pointer called from another thread, `ref`/`out`/`in`, null call) | 13 | 17 |
 | Reference-type variance (valid conversions plus forged boxing, by-ref, wrong-direction, value-type array and generic-argument cases) | 24 | 31 |
+| Additional by-reference parity harness (reference and struct parameters/returns, nested pointer references, 64-bit enums, array variance, generic by-ref calls) | 12 | 19 |
+| Arity boundary (254 integer arguments; expected sum 32,385) | Pass | Pass |
 | Parity probe (generic call sites and targets, forged generic and open instantiations, nested and deep signatures, overrides, interfaces) | 17 (15 pass; the 2 failures are the pre-existing 1.x `ref readonly` return issue in §7) | 75 (68 pass; the 7 failures are the pre-existing generic-dispatch issues in §7, and they fail identically without function pointers) |
 
 What the tests cover:
 
-- **Signatures:** primitive types (`byte`, `short`, `int`, `long`, `double`, …), strings, objects, structs (large and generic), `ref`/`out`/`in`, `ref` returns, nested function pointers, 0–40 arguments, and overloads that differ only by function-pointer signature.
+- **Signatures:** primitive types (`byte`, `short`, `int`, `long`, `double`, …), strings, objects, structs (large and generic), `ref`/`out`/`in`, `ref` returns, nested function pointers, 0–40 mixed-type arguments and 254 integer arguments, and overloads that differ only by function-pointer signature.
+- **Stack-size boundary:** six MDP regression cases cover exactly 255 slots and rejection at 256, including a retained stack value and an implicit `this`. All three rejection cases failed before the fix on both tracks. A generated C# app executes 254-argument calls on nanoCLR and full .NET; 255-argument calls execute on full .NET and are explicitly rejected by MDP.
+- **By-reference parity:** identical by-ref types are supported, including reference types, structs and nested function pointers. The additional harness passes 12/12 on 1.x (debug and stress-GC) and 19/19 on develop (debug, stress-GC and release). The same source, with all generic cases enabled, passes 19/19 on full .NET 10.0.14; explicit `GC.Collect()` is used only on full .NET, while nanoCLR's stress-GC build supplies collection stress. These results verify the tested cases, not unrestricted parity with .NET; the limits in §4 and §7 still apply.
 - **Dispatch:** virtual and interface overloads; arrays and statics of pointers; equality; delegate↔pointer round-trips; `sizeof`; exceptions thrown through `calli`; a pointer called from another thread.
 - **Reference-type variance:** method-group and pointer-to-pointer conversions with contravariant parameters and covariant returns (classes, interfaces, arrays, generic instantiations, class-constrained `T`), and rejection of forged boxing, by-ref, wrong-direction, value-type array and generic-argument variance.
 - **Validation cache:** one call site with many different targets; cache thrash (24 pairs for 16 entries); a pointer validated at one site and rejected at an incompatible site.
