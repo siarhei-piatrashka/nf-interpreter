@@ -86,13 +86,13 @@ nanoFramework PEs are a compact re-encoding of ECMA-335 metadata. The MDP is wha
 2. **`calli` operand.** The IL operand of `calli` is a `StandAloneSig` token. The MDP rewrites it into an index in the nanoFramework signature table (`CodeWriter`, InlineSig). The call-site signature is emitted with `nanoSignaturesTable.GetOrCreateSignatureId(CallSite)`.
 3. **Validation.** `EnsureManagedFunctionPointer` rejects unmanaged calling conventions (`unmanaged`, `cdecl`, `stdcall`, `thiscall`, `fastcall`) with a clear build error. It also rejects `vararg`.
 4. **Custom modifiers.** `modreq`/`modopt` are stripped (`RemoveCustomModifiers`), because nanoFramework signatures have no modifiers. These include `InAttribute` for `in`, `IsExternalInit`, `OutAttribute`, `IsReadOnlyAttribute` and `CallConv*`. After stripping, `in T` encodes as `ref T`, the same as everywhere else in nanoFramework.
-5. **Dependencies.** Types referenced only from function-pointer signatures (return and parameter types) are added to the dependency graph (`nanoAssemblyBuilder.AddTypeDependency`). The minimizer therefore does not drop them.
+5. **Dependencies.** Types referenced only from function-pointer signatures (return and parameter types) are added to the dependency graph (`nanoAssemblyBuilder.AddTypeDependency`). The minimizer therefore does not drop them. On develop, generic-method returns that are function pointers or arrays of them use those signature dependencies too: a function-pointer element has no independent TypeSpec token, so looking one up would assert during minimization.
 6. **Develop.**
-   - `nanoTypeSpecificationsTable` keeps `FunctionPointerType` TypeSpecs, encoded as `I4`. These are needed, for example, for `List<delegate*<int,void>>`-like generic arguments and arrays of function pointers.
+   - `nanoTypeSpecificationsTable` keeps `FunctionPointerType` TypeSpecs, encoded as `I4`, for IL metadata operations such as array element type tokens. C# does not allow function-pointer types as generic type arguments.
    - `ldftn` of a `MethodSpec` (`&Id<string>`) or of a member of a generic type (`&G<int>.M`) keeps the full token, and the runtime resolves it.
 7. **Dumper.** `nanoDumperGenerator` prints `FNPTR` signatures.
 
-Unit tests: `MetadataProcessor.Tests/Core/FunctionPointersTests.cs`, 22 tests on each track.
+Unit tests: `MetadataProcessor.Tests/Core/FunctionPointersTests.cs`, 28 tests on 1.x and 31 on develop.
 
 ### 3.3 nf-interpreter: opcodes
 
@@ -126,6 +126,7 @@ Unit tests: `MetadataProcessor.Tests/Core/FunctionPointersTests.cs`, 22 tests on
          - a class to its base classes and implemented interfaces, and an interface to its base interfaces, via the same `IsInstanceOf` as `castclass`;
          - array covariance for reference element types (`string[]` → `object[]`);
          - an array to `System.Array` and its interfaces.
+       - Arrays of function pointers are reference types too: they convert to `object` and `System.Array`; jagged arrays of them convert to `object[]`. Their elements remain non-reference pointer values, so a one-dimensional array of function pointers does not convert to `object[]` or to an array with a different pointer signature.
        - As in C#, none of the following converts:
          - boxing (value type → `object` or interface);
          - a `ref`/`out`/`in` parameter or a `ref` return whose type differs (`ref string` → `ref object`). These are fully supported when the types are identical, for example `delegate*<ref int, void> p = &M;` for `void M(ref int i)`;
@@ -314,8 +315,8 @@ Function pointers are values. They never allocate, never need GC scanning, and k
 
 | | 1.x | develop |
 |---|---:|---:|
-| Cortex-M4 code (`-Os`, Thumb-2; Interpreter + TypeSystem + Execution) | +1,048 B (29,413 → 30,461) | +4,450 B (50,060 → 54,510) |
-| x86-64 posix `.text` | +1,828 B | +9,176 B |
+| Cortex-M4 code (`-Os`, Thumb-2; Interpreter + TypeSystem + Execution) | +1,036 B (29,413 → 30,449) | +4,450 B (50,060 → 54,510) |
+| x86-64 posix `.text` | +1,810 B | +9,176 B |
 | Static RAM (`CLR_RT_TypeSystem`, 32-bit) | +192 B (272 → 464; validation cache 16 × 12 B) | +332 B (296 → 628; cache 16 × 20 B + registry pointers) |
 | Native stack (Cortex-M4) | `calli` validation within the existing call path | About 1.3 KB peak (960 B comparison frame), constant (no recursion), on the first validation of a (site, target) pair only |
 | Dynamic RAM | none | One `CLR_RT_FunctionPointerRecord` per distinct generic instantiation whose address is taken (native heap, freed at reboot) |
@@ -333,14 +334,15 @@ Develop's larger code size comes from three things: generic-instantiation identi
 
 | Where | 1.x | develop |
 |---|---:|---:|
-| MDP unit tests (`FunctionPointersTests.cs`) | 28 | 28 |
-| CoreLibrary `NFUnitTestFunctionPointers` (on device or nanoCLR) | 39 | 57 (incl. `UnitTestGenericFunctionPointersTests.cs`) |
+| MDP unit tests (`FunctionPointersTests.cs`) | 28 | 31 |
+| CoreLibrary `NFUnitTestFunctionPointers` (on device or nanoCLR) | 41 | 60 (incl. `UnitTestGenericFunctionPointersTests.cs`) |
 | CoreLibrary `NFUnitTestDelegates` (regression) | 46 | 46 |
 | End-to-end harness (debug and stress-GC runtime) | 77 | 110 |
 | Adversarial audit (forged pointers, mismatched signatures, cache poisoning, overload collisions) | 35 | 55 |
 | Edge cases (40 mixed-type parameters, 20 struct parameters with a struct return, equality including generic instantiations, `void*` round-trip, recursion, a pointer called from another thread, `ref`/`out`/`in`, null call) | 13 | 17 |
 | Reference-type variance (valid conversions plus forged boxing, by-ref, wrong-direction, value-type array and generic-argument cases) | 24 | 31 |
 | Additional by-reference parity harness (reference and struct parameters/returns, nested pointer references, 64-bit enums, array variance, generic by-ref calls) | 12 | 19 |
+| Function-pointer array reference conversions (parameters, returns, jagged covariance, implicit pointer conversion; generic arrays on develop) | 6 | 12 |
 | Arity boundary (254 integer arguments; expected sum 32,385) | Pass | Pass |
 | Parity probe (generic call sites and targets, forged generic and open instantiations, nested and deep signatures, overrides, interfaces) | 17 (15 pass; the 2 failures are the pre-existing 1.x `ref readonly` return issue in §7) | 75 (68 pass; the 7 failures are the pre-existing generic-dispatch issues in §7, and they fail identically without function pointers) |
 
@@ -351,6 +353,7 @@ What the tests cover:
 - **By-reference parity:** identical by-ref types are supported, including reference types, structs and nested function pointers. The additional harness passes 12/12 on 1.x (debug and stress-GC) and 19/19 on develop (debug, stress-GC and release). The same source, with all generic cases enabled, passes 19/19 on full .NET 10.0.14; explicit `GC.Collect()` is used only on full .NET, while nanoCLR's stress-GC build supplies collection stress. These results verify the tested cases, not unrestricted parity with .NET; the limits in §4 and §7 still apply.
 - **Dispatch:** virtual and interface overloads; arrays and statics of pointers; equality; delegate↔pointer round-trips; `sizeof`; exceptions thrown through `calli`; a pointer called from another thread.
 - **Reference-type variance:** method-group and pointer-to-pointer conversions with contravariant parameters and covariant returns (classes, interfaces, arrays, generic instantiations, class-constrained `T`), and rejection of forged boxing, by-ref, wrong-direction, value-type array and generic-argument variance.
+- **Pointer-array parity:** the same harness passes 12/12 on full .NET 10.0.14 and develop, and its six non-generic cases pass on 1.x, in debug, stress-GC and release. Before the fix all six failed on 1.x, and the permanent positive array test failed on the old runtime. Four forged conversions remain rejected on both tracks (pointer array to integer array, a different pointer signature array, or `object[]`, and scalar pointer to `object`). Three develop MDP tests minimize and rewrite generic methods returning scalar pointers, pointer arrays and jagged pointer arrays.
 - **Validation cache:** one call site with many different targets; cache thrash (24 pairs for 16 entries); a pointer validated at one site and rejected at an incompatible site.
 - **Develop:**
   - generic methods and types, open and closed;
@@ -374,7 +377,7 @@ The following were found during testing. None is caused by this work, and apart 
 - Cross-assembly generic-struct `FieldRef` fails with "Unknown FieldRef".
 - MDP: `RuntimeHelpersTests` triggers an assert. Building all of `NFUnitTestClasses` in one assembly overflows the string table.
 - Develop: a virtual method overridden in a class derived from a closed generic base (`GDerived : GBase<int>`) dispatches to the base implementation. Calls on generic interfaces (`IGen<int>`) throw.
-- Develop: a generic method called with another generic method's type parameter (`A<T>() => B<T>()`) runs with an open MethodSpec. Most type-dependent operations in `B` assert ("nested MVAR not implemented"). `calli` validation rejects such contexts (§4).
+- Develop: a generic method called with another generic method's type parameter (`A<T>() => B<T>()`) runs with an open MethodSpec. Most type-dependent operations in `B` assert ("nested MVAR not implemented"). `calli` validation rejects signatures that require this unresolved context (§4). In particular, if `B<T>` builds and returns an array containing `&Identity<T>`, taking `&B<T>` in `A<T>` can construct the array, but invoking its elements is rejected. This nested method-context case remains unsupported; the passing generic-array tests use closed factories and pass their arrays through generic methods without introducing a further open method context.
 - Develop, stress-GC build only: an interface call on a boxed struct throws when the same method also passes a struct as an `in` argument.
 - Develop: methods with nested generic struct locals (`S<S<S<int>>>`) do not run. Constructing nested generic class objects (`new C<C<C<int>>>`) throws.
 - 1.x: a method that returns `ref readonly` (modreq `InAttribute` on the return type) corrupts the stack, even on a direct call. The 1.x MDP has no `RequiredModifierType` branch in `WriteDataType`, so it writes the return type as `void`. The PE is byte-identical with the upstream MDP. `ref readonly` *returns* through function pointers are therefore not usable on 1.x; `in` parameters work.

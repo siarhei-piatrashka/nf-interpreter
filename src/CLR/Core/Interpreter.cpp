@@ -485,8 +485,7 @@ static bool FunctionPointer_IsReferenceConversion(
     const CLR_RT_SignatureParser::Element &from,
     const CLR_RT_SignatureParser::Element &to)
 {
-    if (from.m_fByRef || to.m_fByRef || from.m_fnPtrSig != nullptr || to.m_fnPtrSig != nullptr ||
-        to.m_levels > from.m_levels)
+    if (from.m_fByRef || to.m_fByRef || to.m_levels > from.m_levels)
     {
         return false;
     }
@@ -494,6 +493,7 @@ static bool FunctionPointer_IsReferenceConversion(
     if (from.m_levels > to.m_levels)
     {
         // an array (element of the array) to System.Object, System.Array or one of its interfaces
+        // includes arrays of function pointers: the array, unlike its elements, is a reference type
         return to.m_cls.m_data == g_CLR_RT_WellKnownTypes.m_Object.m_data ||
                CLR_RT_ExecutionEngine::IsInstanceOf(g_CLR_RT_WellKnownTypes.m_Array, to.m_cls);
     }
